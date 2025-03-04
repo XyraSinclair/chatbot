@@ -4,10 +4,20 @@ import streamlit as st
 from openai import OpenAI
 import json
 import os
+import re
+import time
+from typing import Dict, List, Tuple, Any, Optional
 
 # Initialize OpenAI client
 openai_api_key = st.secrets.openai_api_key
 client = OpenAI(api_key=openai_api_key)
+
+# Configure the page
+st.set_page_config(
+    page_title="Analytic Hierarchy Process (AHP) Agent",
+    page_icon="📊",
+    layout="wide"
+)
 
 # Define the geometric mean PCM solver
 def solve_pcm_geometric_mean(pcm):
@@ -35,468 +45,781 @@ def solve_pcm_geometric_mean(pcm):
     return weights / np.sum(weights)
 
 # Cache configuration
-CACHE_FILE = "llm_ratings_cache.json"
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
+def get_cache_file(prefix=""):
+    """Get the cache file path with optional prefix"""
+    return os.path.join(CACHE_DIR, f"{prefix}_ahp_cache.json")
 
-def load_cache():
+def load_cache(prefix=""):
     """Load the cache from file or return empty cache if file doesn't exist"""
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'r') as f:
+    cache_file = get_cache_file(prefix)
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
             return json.load(f)
     return {}
 
-
-def save_cache(cache):
+def save_cache(cache, prefix=""):
     """Save the cache to file"""
-    with open(CACHE_FILE, 'w') as f:
+    cache_file = get_cache_file(prefix)
+    with open(cache_file, 'w') as f:
         json.dump(cache, f, indent=2)
 
-
 def get_cache_key(i, j):
-    """Generate a consistent cache key for tweet pair comparison"""
+    """Generate a consistent cache key for item pair comparison"""
     return f"{i}_{j}"
-
 
 def get_cached_comparison(cache, attribute, i, j):
     """Get a cached comparison if it exists"""
     if attribute not in cache:
         return None
     cache_key = get_cache_key(i, j)
-    return cache[attribute].get("tweet_pairs", {}).get(cache_key)
+    return cache[attribute].get("item_pairs", {}).get(cache_key)
 
-
-# Load tweets and attributes from JSON file
-def load_data():
-    """Load the tweets and attributes from the data.json file"""
+# Load default tweets from data.json
+def load_default_data():
+    """Load the tweets from the data.json file"""
     try:
         with open('data.json', 'r') as f:
             data = json.load(f)
             tweets = data.get('tweets', [])
-            attributes_data = data.get('attributes', [])
-            
-            # Convert attributes to the format expected by the app
-            attributes = [(attr['name'], attr['prompt']) for attr in attributes_data]
-            
-            return tweets, attributes
+            return tweets
     except Exception as e:
         st.error(f"Error loading data: {e}")
-        return [], []
+        return []
 
-# Load the data
-tweets, attributes = load_data()
+# Initialize state for items
+if "items" not in st.session_state:
+    st.session_state.items = load_default_data()
 
-# Show title and description
-st.title("LLM Pairwise Ratio Comparison Analysis")
-st.write("How well can LLMs put meaningful numbers on stuff across interesting subjective attributes?")
+if "goal" not in st.session_state:
+    st.session_state.goal = "Find the relative utilities of me reading these tweets"
 
-# Store results in session state and preload with example data
-if "attribute_scores" not in st.session_state:
-    # Create example 4x4 ratio comparison matrix for demonstration
-    def create_example_matrices():
-        # Choose first 4 tweets to keep it manageable
-        demo_tweets = tweets[:4]
-        n = len(demo_tweets)
-        example_matrices = {}
+if "attributes" not in st.session_state:
+    st.session_state.attributes = []
+
+if "attribute_weights" not in st.session_state:
+    st.session_state.attribute_weights = {}
+    
+if "attribute_matrices" not in st.session_state:
+    st.session_state.attribute_matrices = {}
+    
+if "ahp_scores" not in st.session_state:
+    st.session_state.ahp_scores = {}
+    
+if "direct_scores" not in st.session_state:
+    st.session_state.direct_scores = {}
+
+def query_llm_for_attributes(items, goal, num_attributes=5):
+    """
+    Query the LLM to generate attributes for evaluation based on the goal
+    """
+    cache = load_cache("attributes")
+    cache_key = f"{goal}_{len(items)}"
+    
+    if cache_key in cache:
+        st.success("Using cached attributes")
+        return cache[cache_key]
+    
+    # Get a sample of items (if many) to avoid token limits
+    sample_items = items[:5] if len(items) > 5 else items
+    
+    st.info("Generating attributes based on goal...")
+    
+    try:
+        prompt = f"""You are an analytic hierarchy process agent. You are interested in this goal: {goal}.
+
+Below are some sample items that users will be evaluating:
+
+{json.dumps(sample_items, indent=2)}
+
+Based on the goal and these items, come up with {num_attributes} attributes that would be relevant for evaluation. 
+For each attribute:
+1. Provide a clear name
+2. Provide a description
+3. Provide a comparison prompt (e.g., "How much more [attribute] is item A compared to item B?")
+
+Format your response as a JSON array with objects containing 'name', 'description', and 'prompt' fields. 
+The attributes should be diverse and capture different aspects relevant to the goal.
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant skilled in designing evaluation frameworks."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000,
+            response_format={"type": "json_object"}
+        )
         
-        # Create example matrices for the first 3 attributes
-        for attr_name, _ in attributes[:3]:
-            # Initialize matrix with 1's on diagonal
-            matrix = [[1.0 for _ in range(n)] for _ in range(n)]
-            
-            # Fill upper triangle with sample values
-            # These are sample ratios that make mathematical sense
-            if attr_name == attributes[0][0]:  # First attribute
-                matrix[0][1], matrix[0][2], matrix[0][3] = 2.0, 1.5, 3.0
-                matrix[1][2], matrix[1][3] = 0.75, 1.5
-                matrix[2][3] = 2.0
-            elif attr_name == attributes[1][0]:  # Second attribute
-                matrix[0][1], matrix[0][2], matrix[0][3] = 0.5, 1.0, 0.33
-                matrix[1][2], matrix[1][3] = 2.0, 0.67
-                matrix[2][3] = 0.33
-            else:  # Third attribute
-                matrix[0][1], matrix[0][2], matrix[0][3] = 1.0, 0.5, 1.5
-                matrix[1][2], matrix[1][3] = 0.5, 1.5
-                matrix[2][3] = 3.0
-            
-            # Fill lower triangle with reciprocals
-            for i in range(n):
-                for j in range(i+1, n):
-                    matrix[j][i] = 1.0 / matrix[i][j] if matrix[i][j] != 0 else 0
-            
-            # Store in example matrices
-            example_matrices[attr_name] = matrix
+        result = json.loads(response.choices[0].message.content)
+        attributes = result.get("attributes", [])
         
-        return example_matrices
-    
-    # Initialize with example data
-    st.session_state.attribute_scores = create_example_matrices()
-
-# Get a default attribute to always show
-default_attr = next(iter(st.session_state.attribute_scores.keys()))
-
-# Layout for the main display - move matrix and weights to top
-st.header("Pairwise Comparison Matrix")
-
-col1, col2 = st.columns([3, 2])
-
-with col1:
-    # Get matrix for default attribute (practicality) to display upfront
-    default_matrix = st.session_state.attribute_scores[default_attr]
-    
-    # Create labels for the matrix
-    n_default = len(default_matrix)
-    default_labels = [f"Tweet {i+1}" for i in range(n_default)]
-    
-    # Display the matrix
-    st.subheader(f"Matrix for '{default_attr}'")
-    default_df = pd.DataFrame(default_matrix, index=default_labels, columns=default_labels)
-    st.dataframe(default_df.style.format("{:.2f}"))
-
-with col2:
-    # Calculate and display the weights for the default attribute
-    default_matrix_np = np.array(default_matrix)
-    default_weights = solve_pcm_geometric_mean(default_matrix_np)
-    
-    # Create weight dataframe
-    st.subheader("Weights (Geometric Mean)")
-    default_weight_df = pd.DataFrame({
-        'Tweet': [f"Tweet {i+1}" for i in range(len(default_weights))],
-        'Weight': default_weights
-    })
-    st.dataframe(default_weight_df.sort_values('Weight', ascending=False).style.format({'Weight': '{:.4f}'}))
-
-# Layout for the controls section
-control_col1, control_col2 = st.columns([2, 1])
-
-with control_col1:
-    # Select attribute to analyze
-    selected_attribute = st.selectbox("Select attribute to analyze:",
-                                     [attr[0] for attr in attributes],
-                                     key="attribute_selector")
-    
-    # Find the corresponding prompt for the selected attribute
-    selected_prompt = next(
-        (prompt for name, prompt in attributes if name == selected_attribute), "")
+        # Cache the results
+        cache[cache_key] = attributes
+        save_cache(cache, "attributes")
         
-with control_col2:
-    # Button to run analysis for the selected attribute 
-    st.write("") # Add space for alignment
-    st.write("")
-    if st.button("Analyze Selected Attribute", use_container_width=True):
-        with st.spinner(f"Analyzing '{selected_attribute}'..."):
-            analyze_selected_attribute()
+        return attributes
+        
+    except Exception as e:
+        st.error(f"Error generating attributes: {e}")
+        # Fallback to default attributes
+        return [
+            {
+                "name": "relevance",
+                "description": "How relevant the item is to the goal",
+                "prompt": "How much more relevant to the goal is item A than item B?"
+            },
+            {
+                "name": "impact",
+                "description": "The potential impact of the item",
+                "prompt": "How much more impactful is item A than item B?"
+            },
+            {
+                "name": "quality",
+                "description": "The overall quality of the item",
+                "prompt": "How much higher quality is item A than item B?"
+            }
+        ]
 
-# Display tweets for reference
-with st.expander("View All Tweets"):
-    # Add a numerical ID to each tweet for easier display
-    numbered_tweets = {f"Tweet {i+1}": tweet for i, tweet in enumerate(tweets)}
-    for tweet_id, tweet_text in numbered_tweets.items():
-        st.markdown(f"**{tweet_id}:** {tweet_text}")
-
-# Option to upload custom data
-with st.expander("Upload Custom Data"):
-    st.write("You can upload your own JSON file with tweets and attributes.")
-    st.write("The file should follow this format:")
-    st.code('''
-{
-  "tweets": [
-    "Tweet text 1",
-    "Tweet text 2",
-    ...
-  ],
-  "attributes": [
-    {
-      "name": "attribute_name_1",
-      "prompt": "comparison prompt for this attribute"
-    },
-    ...
-  ]
-}
-    ''')
+def query_llm_for_attribute_comparisons(attributes, goal):
+    """
+    Query the LLM to do pairwise comparisons of attributes
+    Returns a pairwise comparison matrix for the attributes
+    """
+    cache = load_cache("attribute_weights")
+    attributes_key = "+".join([attr["name"] for attr in attributes]) + "_" + goal
     
-    uploaded_file = st.file_uploader("Upload JSON file", type=["json"])
-    if uploaded_file is not None:
-        try:
-            data = json.load(uploaded_file)
-            new_tweets = data.get('tweets', [])
-            new_attributes_data = data.get('attributes', [])
-            
-            if new_tweets and new_attributes_data:
-                # Convert attributes to the format expected by the app
-                new_attributes = [(attr['name'], attr['prompt']) for attr in new_attributes_data]
+    if attributes_key in cache:
+        st.success("Using cached attribute weights")
+        return cache[attributes_key]
+    
+    st.info("Comparing attributes based on goal...")
+    
+    n = len(attributes)
+    pcm = np.ones((n, n))
+    
+    try:
+        # For each pair of attributes, ask LLM to compare
+        for i in range(n):
+            for j in range(i+1, n):
+                attr_a = attributes[i]
+                attr_b = attributes[j]
                 
-                # Update the global variables
-                tweets = new_tweets
-                attributes = new_attributes
-                
-                # Clear existing scores to prevent mismatches
-                st.session_state.attribute_scores = {}
-                
-                st.success(f"Loaded {len(tweets)} tweets and {len(attributes)} attributes successfully!")
-            else:
-                st.error("Invalid JSON format. Make sure it contains 'tweets' and 'attributes' arrays.")
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
+                prompt = f"""In the context of this goal: "{goal}"
 
-# Divider before additional results
-st.markdown("---")
-st.header("Selected Attribute Analysis")
+I need to compare the relative importance of two attributes:
 
+Attribute A: {attr_a['name']} - {attr_a['description']}
+Attribute B: {attr_b['name']} - {attr_b['description']}
 
-# Define the analysis function
-def analyze_selected_attribute():
-    """Calculate the pairwise comparison matrix for just the selected attribute"""
-    attribute_name = selected_attribute
-    attribute_prompt = selected_prompt
+How much more important is Attribute A compared to Attribute B for achieving the goal?
+Express your answer as a single ratio number.
+- If A is twice as important as B, respond with "2"
+- If A is slightly more important than B, respond with a value between 1 and 2 (e.g., "1.5")
+- If A and B are equally important, respond with "1"
+- If B is more important than A, respond with a value less than 1 (e.g., "0.5" if B is twice as important as A)
 
-    # Load cache
-    cache = load_cache()
+Provide only the numerical value with no additional text."""
 
-    # Initialize progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    comparison_matrix = []
-    n = len(tweets)
-
-    # Create empty n×n matrix
-    for i in range(n):
-        comparison_matrix.append([0] * n)
-        # Set diagonal to 1 (self-comparison)
-        comparison_matrix[i][i] = 1
-
-    # Calculate total number of comparisons needed
-    total_comparisons = n * (n - 1) // 2
-    comparisons_done = 0
-
-    # Initialize cache structure for this attribute if it doesn't exist
-    if attribute_name not in cache:
-        cache[attribute_name] = {"tweet_pairs": {}}
-
-    # Fill the upper triangular part of the matrix
-    for i in range(n):
-        for j in range(i+1, n):
-            # Check cache first
-            cached_ratio = get_cached_comparison(cache, attribute_name, i, j)
-
-            if cached_ratio is not None:
-                ratio = cached_ratio
-                status_text.text(
-                    f"Using cached comparison for Tweet {i+1} with Tweet {j+1}")
-            else:
-                tweet_a = tweets[i]
-                tweet_b = tweets[j]
-
-                # Update progress
-                status_text.text(f"Comparing Tweet {i+1} with Tweet {j+1}...")
-
-                # Get LLM response for comparison
                 response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-4",
                     messages=[
-                        {"role": "system", "content": "You are a helpful assistant that evaluates relative properties of texts. "
-                         "Respond with a single numerical ratio. For example, if the first text is "
-                         "twice as practical as the second, respond with '2'. If it's half as practical, "
-                         "respond with '0.5'. If they're equal, respond with '1'."},
-                        {"role": "user", "content": f"{attribute_prompt}\n\nTweet A: {tweet_a}\n\nTweet B: {tweet_b}"}
+                        {"role": "system", "content": "You are a helpful assistant skilled in analytical decision making."},
+                        {"role": "user", "content": prompt}
                     ],
-                    temperature=0.2,
+                    temperature=0.3,
                     max_tokens=10
                 )
-
+                
                 try:
                     ratio = float(response.choices[0].message.content.strip())
+                    pcm[i, j] = ratio
+                    pcm[j, i] = 1.0 / ratio
                 except ValueError:
-                    ratio = 1
+                    st.warning(f"Could not parse response for {attr_a['name']} vs {attr_b['name']}, using default value of 1")
+                    pcm[i, j] = 1.0
+                    pcm[j, i] = 1.0
+        
+        # Cache the results
+        cache[attributes_key] = pcm.tolist()
+        save_cache(cache, "attribute_weights")
+        
+        return pcm.tolist()
+        
+    except Exception as e:
+        st.error(f"Error comparing attributes: {e}")
+        # Return identity matrix as fallback
+        return np.ones((n, n)).tolist()
 
-                # Cache the new comparison
-                cache[attribute_name]["tweet_pairs"][get_cache_key(
-                    i, j)] = ratio
-                cache[attribute_name]["tweet_pairs"][get_cache_key(
-                    j, i)] = 1 / ratio if ratio != 0 else 0
+def query_llm_for_item_comparisons(items, attribute):
+    """
+    Query the LLM to do pairwise comparisons of items for a specific attribute
+    Returns a pairwise comparison matrix for the items
+    """
+    cache = load_cache("item_comparisons")
+    cache_key = attribute["name"]
+    
+    if cache_key in cache and len(cache[cache_key].get("item_pairs", {})) >= (len(items) * (len(items) - 1)):
+        st.success(f"Using cached comparisons for {attribute['name']}")
+        
+        # Reconstruct the matrix from cache
+        n = len(items)
+        pcm = np.ones((n, n))
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                pair_key = get_cache_key(i, j)
+                if pair_key in cache[cache_key]["item_pairs"]:
+                    ratio = cache[cache_key]["item_pairs"][pair_key]
+                    pcm[i, j] = ratio
+                    pcm[j, i] = 1.0 / ratio if ratio != 0 else 0
+        
+        return pcm.tolist()
+    
+    # Initialize cache structure for this attribute if it doesn't exist
+    if cache_key not in cache:
+        cache[cache_key] = {"item_pairs": {}}
+    
+    st.info(f"Comparing items based on {attribute['name']}...")
+    
+    n = len(items)
+    pcm = np.ones((n, n))
+    
+    # Calculate total comparisons
+    total_comparisons = n * (n - 1) // 2
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    comparisons_done = 0
+    
+    try:
+        # For each pair of items, ask LLM to compare
+        for i in range(n):
+            for j in range(i+1, n):
+                item_a = items[i]
+                item_b = items[j]
+                
+                # Check if comparison is already cached
+                pair_key = get_cache_key(i, j)
+                if pair_key in cache[cache_key]["item_pairs"]:
+                    ratio = cache[cache_key]["item_pairs"][pair_key]
+                    status_text.text(f"Using cached comparison for Item {i+1} with Item {j+1}")
+                else:
+                    status_text.text(f"Comparing Item {i+1} with Item {j+1} for {attribute['name']}...")
+                    
+                    prompt = f"""{attribute['prompt']}
 
-                # Save cache after each new comparison
-                save_cache(cache)
+Item A: {item_a}
 
-            # Fill both positions in the matrix
-            comparison_matrix[i][j] = ratio
-            comparison_matrix[j][i] = 1 / ratio if ratio != 0 else 0
+Item B: {item_b}
 
-            # Update progress
-            comparisons_done += 1
-            progress_bar.progress(comparisons_done / total_comparisons)
+Respond with a single numerical ratio. For example, if A is twice as good as B, respond with "2". 
+If A is half as good as B, respond with "0.5". If they're equal, respond with "1"."""
 
-    # Clear status text when done
-    status_text.empty()
-    progress_bar.empty()
+                    response = client.chat.completions.create(
+                        model="gpt-4",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant that evaluates relative properties of items."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.3,
+                        max_tokens=10
+                    )
+                    
+                    try:
+                        ratio = float(response.choices[0].message.content.strip())
+                        # Cache the result
+                        cache[cache_key]["item_pairs"][pair_key] = ratio
+                        cache[cache_key]["item_pairs"][get_cache_key(j, i)] = 1.0 / ratio if ratio != 0 else 0
+                        save_cache(cache, "item_comparisons")
+                    except ValueError:
+                        st.warning(f"Could not parse response for comparison of items {i+1} and {j+1}, using default value of 1")
+                        ratio = 1.0
+                
+                pcm[i, j] = ratio
+                pcm[j, i] = 1.0 / ratio if ratio != 0 else 0
+                
+                # Update progress
+                comparisons_done += 1
+                progress_bar.progress(comparisons_done / total_comparisons)
+        
+        # Clear status text and progress bar when done
+        status_text.empty()
+        progress_bar.empty()
+        
+        return pcm.tolist()
+        
+    except Exception as e:
+        st.error(f"Error comparing items for {attribute['name']}: {e}")
+        # Return identity matrix as fallback
+        return np.ones((n, n)).tolist()
 
-    # Store result in session state
-    st.session_state.attribute_scores[attribute_name] = comparison_matrix
+def calculate_ahp_scores(items, attributes, attribute_weights, item_matrices):
+    """
+    Calculate the final AHP scores for each item
+    """
+    n_items = len(items)
+    n_attrs = len(attributes)
+    
+    # Calculate the weight for each attribute
+    attr_weights = solve_pcm_geometric_mean(np.array(attribute_weights))
+    
+    # Calculate item scores for each attribute
+    item_scores = np.zeros((n_attrs, n_items))
+    for i, attr in enumerate(attributes):
+        # Get the item matrix for this attribute
+        item_matrix = item_matrices[attr["name"]]
+        # Calculate weights using geometric mean
+        item_scores[i] = solve_pcm_geometric_mean(np.array(item_matrix))
+    
+    # Final scores are weighted sum of attribute scores
+    final_scores = np.zeros(n_items)
+    for i in range(n_items):
+        for j in range(n_attrs):
+            final_scores[i] += attr_weights[j] * item_scores[j, i]
+    
+    # Return normalized scores (sum to 1)
+    return final_scores / np.sum(final_scores)
 
-    return comparison_matrix
+def query_llm_for_direct_ranking(items, goal):
+    """
+    Query the LLM to directly rank the items based on the goal
+    """
+    cache = load_cache("direct_ranking")
+    items_hash = str(hash(str(items) + goal))
+    
+    if items_hash in cache:
+        st.success("Using cached direct ranking")
+        return cache[items_hash]
+    
+    st.info("Getting direct ranking of items...")
+    
+    try:
+        prompt = f"""Please directly rank the following items based on this goal: "{goal}"
 
+Items to rank:
+{json.dumps(items, indent=2)}
 
-# Display results for the selected attribute
-st.subheader(f"Analysis for '{selected_attribute}'")
+For each item, assign a utility score from 0 to 100, where 100 is the highest possible utility. 
+Think step by step about how each item contributes to the goal.
 
-# Get the matrix for the selected attribute if available, otherwise use first available attribute
-if selected_attribute in st.session_state.attribute_scores:
-    matrix = st.session_state.attribute_scores[selected_attribute]
-    display_attr_name = selected_attribute
-else:
-    # If not analyzed yet, show notice
-    matrix = st.session_state.attribute_scores[default_attr]
-    display_attr_name = default_attr
-    st.info(f"Select an attribute and click 'Analyze Selected Attribute' to see results for that attribute.")
+Format your response as a JSON object with the following structure:
+{{
+  "scores": {{
+    "0": 85,
+    "1": 62,
+    ...
+  }},
+  "reasoning": "Detailed explanation of your reasoning, especially for the top 3 ranked items."
+}}
 
-# Display results in a two-column layout
-col1, col2 = st.columns([3, 2])
+Where the keys in the "scores" object are the item indices (starting from 0).
+"""
 
-# Limit label count to matrix size
-n_tweets_to_display = min(len(matrix), len(tweets))
-display_tweets = tweets[:n_tweets_to_display]
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant skilled in analytical decision making."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1500,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        
+        # Extract scores and reasoning
+        scores = {}
+        reasoning = ""
+        
+        # Handle different possible JSON structures
+        if "scores" in result:
+            scores = result["scores"]
+        elif isinstance(result, dict) and all(k.isdigit() for k in result.keys()):
+            # Handle case where the model returned just the scores object directly
+            scores = result
+        
+        if "reasoning" in result:
+            reasoning = result["reasoning"]
+        
+        # Convert string keys to integers if needed
+        scores_dict = {int(k): float(v) for k, v in scores.items()}
+        
+        # Normalize scores to sum to 1
+        total = sum(scores_dict.values())
+        if total > 0:  # Prevent division by zero
+            normalized_scores = {k: v/total for k, v in scores_dict.items()}
+        else:
+            normalized_scores = scores_dict
+        
+        # Cache the results
+        cache[items_hash] = {"scores": normalized_scores, "reasoning": reasoning}
+        save_cache(cache, "direct_ranking")
+        
+        return {"scores": normalized_scores, "reasoning": reasoning}
+        
+    except Exception as e:
+        st.error(f"Error getting direct ranking: {e}")
+        # Return empty dict as fallback
+        return {"scores": {}, "reasoning": ""}
 
-# Left column: Display the comparison matrix
+def run_ahp_analysis():
+    """
+    Run the complete AHP analysis process
+    """
+    items = st.session_state.items
+    goal = st.session_state.goal
+    
+    if not items:
+        st.error("Please add some items to evaluate")
+        return
+    
+    with st.spinner("Running AHP analysis..."):
+        # Step 1: Generate attributes
+        attributes = query_llm_for_attributes(items, goal)
+        st.session_state.attributes = attributes
+        
+        # Step 2: Compare attributes
+        attribute_matrix = query_llm_for_attribute_comparisons(attributes, goal)
+        st.session_state.attribute_weights = attribute_matrix
+        
+        # Step 3: For each attribute, compare items
+        item_matrices = {}
+        for attr in attributes:
+            item_matrix = query_llm_for_item_comparisons(items, attr)
+            item_matrices[attr["name"]] = item_matrix
+        
+        st.session_state.attribute_matrices = item_matrices
+        
+        # Step 4: Calculate AHP scores
+        ahp_scores = calculate_ahp_scores(items, attributes, attribute_matrix, item_matrices)
+        st.session_state.ahp_scores = {i: score for i, score in enumerate(ahp_scores)}
+        
+        # Step 5: Get direct ranking for comparison
+        direct_result = query_llm_for_direct_ranking(items, goal)
+        st.session_state.direct_scores = direct_result["scores"]
+        st.session_state.direct_reasoning = direct_result.get("reasoning", "")
+    
+    st.success("AHP analysis completed!")
+
+# Main app UI
+st.title("Analytic Hierarchy Process (AHP) Agent")
+st.write("This app uses the Analytic Hierarchy Process to evaluate and rank items based on multiple criteria.")
+
+# Setup section
+st.header("Setup")
+
+# Input the goal
+st.subheader("Goal")
+goal_input = st.text_area("What is your evaluation goal?", value=st.session_state.goal, height=100)
+if goal_input != st.session_state.goal:
+    st.session_state.goal = goal_input
+
+# Input items to evaluate
+st.subheader("Items to Evaluate")
+
+# Create two columns for the items section
+col1, col2 = st.columns([3, 1])
+
 with col1:
-    # Create labels for the matrix
-    labels = [f"Tweet {i+1}" for i in range(n_tweets_to_display)]
+    item_count = len(st.session_state.items)
+    item_text = "\n\n".join(st.session_state.items)
     
-    # Convert to pandas DataFrame for better display
-    df = pd.DataFrame(matrix, index=labels, columns=labels)
+    items_input = st.text_area(
+        "Enter the items to evaluate (one per line or separated by blank lines):",
+        value=item_text,
+        height=300
+    )
     
-    # Display the matrix
-    st.dataframe(df.style.format("{:.2f}"))
-    
-    st.caption("""
-    **How to read this matrix:** Each cell (i,j) shows how much more of the attribute Tweet i has compared to Tweet j. 
-    Values > 1 mean Tweet i has more, values < 1 mean less. Diagonal = 1, and cell (j,i) = 1/cell(i,j).
-    """)
+    # Parse and update items when input changes
+    if items_input != item_text:
+        # Split by double newlines or single newlines
+        new_items = re.split(r'\n\n|\n', items_input)
+        # Filter out empty items
+        new_items = [item.strip() for item in new_items if item.strip()]
+        st.session_state.items = new_items
 
-# Convert to numpy array and solve using geometric mean
-matrix_np = np.array(matrix)
-weights = solve_pcm_geometric_mean(matrix_np)
-
-# Right column: Display weights
 with col2:
-    n_weights = len(weights)  # Get the number of weights
-    weight_df = pd.DataFrame({
-        'Tweet': [f"Tweet {i+1}" for i in range(n_weights)],
-        'Weight': weights
-    })
-    st.dataframe(weight_df.sort_values('Weight', ascending=False).style.format({'Weight': '{:.4f}'}))
+    st.write("**Add Individual Items**")
     
-    st.caption("""
-    **About these weights:** Computed using geometric mean method (nth root of row products, normalized). 
-    Higher weights indicate better performance on this attribute.
-    """)
-
-# Display ranked tweets 
-st.subheader(f"Tweets Ranked by {display_attr_name.title()}")
-
-# Create a top 3 summary view
-top_indices = np.argsort(-weights)[:3]  # Get indices of top 3
-ranked_col1, ranked_col2, ranked_col3 = st.columns(3)
-
-with ranked_col1:
-    if len(top_indices) > 0:
-        idx = top_indices[0]
-        st.markdown(f"**🥇 First Place (Weight: {weights[idx]:.4f})**")
-        st.markdown(f"*Tweet {idx+1}:* {display_tweets[idx][:100]}..." if len(display_tweets[idx]) > 100 else f"*Tweet {idx+1}:* {display_tweets[idx]}")
-
-with ranked_col2:
-    if len(top_indices) > 1:
-        idx = top_indices[1]
-        st.markdown(f"**🥈 Second Place (Weight: {weights[idx]:.4f})**")
-        st.markdown(f"*Tweet {idx+1}:* {display_tweets[idx][:100]}..." if len(display_tweets[idx]) > 100 else f"*Tweet {idx+1}:* {display_tweets[idx]}")
-
-with ranked_col3:
-    if len(top_indices) > 2:
-        idx = top_indices[2]
-        st.markdown(f"**🥉 Third Place (Weight: {weights[idx]:.4f})**")
-        st.markdown(f"*Tweet {idx+1}:* {display_tweets[idx][:100]}..." if len(display_tweets[idx]) > 100 else f"*Tweet {idx+1}:* {display_tweets[idx]}")
-
-# Show all tweets in expanders
-with st.expander("See all ranked tweets"):
-    sorted_indices = np.argsort(-weights)  # Negative to sort descending
+    new_item = st.text_area("New item:", height=100, key="new_item_input")
     
-    for rank, idx in enumerate(sorted_indices):
-        if idx < len(display_tweets):
-            st.markdown(f"**Rank {rank+1} (Weight: {weights[idx]:.4f}):** {display_tweets[idx]}")
-
-# Always show summary table with weights (example data is preloaded)
-st.header("Attribute Weight Summary (Geometric Mean Method)")
-st.write("This table shows the calculated weights for each tweet across all analyzed attributes using the geometric mean method.")
-
-# Create a DataFrame with tweets as rows
-summary_data = []
-analyzed_attributes = list(st.session_state.attribute_scores.keys())
-
-# Only process the first 4 tweets for the preloaded example
-display_tweets = tweets[:4] if len(tweets) > 4 else tweets
-
-# For each tweet, collect its weights across attributes
-for i, tweet in enumerate(display_tweets):
-    row_data = {'Tweet ID': f'Tweet {i+1}'}
+    if st.button("Add Item", use_container_width=True):
+        if new_item.strip():
+            st.session_state.items.append(new_item.strip())
+            # Clear the input
+            st.session_state.new_item_input = ""
+            st.rerun()
     
-    # First 30 characters of the tweet for better identification
-    row_data['Tweet Preview'] = tweet[:30] + "..." if len(tweet) > 30 else tweet
+    if st.button("Clear All Items", use_container_width=True):
+        st.session_state.items = []
+        st.rerun()
     
-    # Add weights for each analyzed attribute
-    for attr in analyzed_attributes:
-        matrix = st.session_state.attribute_scores[attr]
-        matrix_np = np.array(matrix)
-        n = len(matrix_np)
-        
-        # Calculate weights using geometric mean method
-        weights = solve_pcm_geometric_mean(matrix_np)
-        
-        # Store the weight for this tweet and attribute
-        if i < len(weights):
-            row_data[attr] = weights[i]
-    
-    summary_data.append(row_data)
+    st.write(f"Total items: **{len(st.session_state.items)}**")
 
-# Create and display the DataFrame
-summary_df = pd.DataFrame(summary_data)
+# Run analysis button
+if st.button("Run AHP Analysis", type="primary", use_container_width=True):
+    run_ahp_analysis()
 
-# Style for better display
-def highlight_max(s):
-    is_max = s == s.max()
-    return ['background-color: #d4f1d4' if v else '' for v in is_max]
-
-# Apply styling to numeric columns only
-style_cols = analyzed_attributes
-
-st.dataframe(
-    summary_df.style
-    .format({col: '{:.4f}' for col in analyzed_attributes})
-    .apply(highlight_max, subset=style_cols)
-)
-
-# Add explanation
-st.info("""
-**How to read this table:**
-- Each row represents a tweet
-- Each column represents an attribute
-- Values show the calculated weights (higher is better)
-- Green highlighting indicates the highest-scoring tweet for each attribute
-""")
-
-# Add download button for the summary table
-@st.cache_data
-def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode('utf-8')
-
-csv = convert_df_to_csv(summary_df)
-
-st.download_button(
-    label="Download Summary Table as CSV",
-    data=csv,
-    file_name="tweet_attribute_weights.csv",
-    mime="text/csv",
-)
-
-# Footer with additional information
 st.markdown("---")
-st.caption("This application demonstrates LLM-based pairwise ratio comparisons for text evaluation.")
-st.caption("Results are cached to disk for faster loading of previously analyzed attributes.")
+
+# Main area for results
+if st.session_state.attributes:
+    # Display the attributes
+    st.header("Attributes for Evaluation")
+    
+    attributes_df = pd.DataFrame([
+        {
+            "Name": attr["name"], 
+            "Description": attr.get("description", ""), 
+            "Comparison Prompt": attr["prompt"]
+        } 
+        for attr in st.session_state.attributes
+    ])
+    
+    st.dataframe(attributes_df, hide_index=True)
+    
+    # Display attribute weights
+    if st.session_state.attribute_weights:
+        st.header("Attribute Importance Weights")
+        
+        # Calculate attribute weights
+        attr_weights = solve_pcm_geometric_mean(np.array(st.session_state.attribute_weights))
+        
+        # Create a DataFrame for attribute weights
+        attr_weight_df = pd.DataFrame({
+            "Attribute": [attr["name"] for attr in st.session_state.attributes],
+            "Weight": attr_weights
+        })
+        
+        # Sort by weight descending
+        attr_weight_df = attr_weight_df.sort_values("Weight", ascending=False)
+        
+        # Display as a bar chart
+        st.bar_chart(attr_weight_df.set_index("Attribute"))
+        
+        # Display the pairwise comparison matrix
+        with st.expander("View Attribute Pairwise Comparison Matrix"):
+            attr_names = [attr["name"] for attr in st.session_state.attributes]
+            attr_pcm_df = pd.DataFrame(st.session_state.attribute_weights, index=attr_names, columns=attr_names)
+            st.dataframe(attr_pcm_df.style.format("{:.2f}"))
+    
+    # Display item comparison matrices for each attribute
+    if st.session_state.attribute_matrices:
+        st.header("Item Comparisons by Attribute")
+        
+        # Create tabs for each attribute
+        tabs = st.tabs([attr["name"] for attr in st.session_state.attributes])
+        
+        for i, attr in enumerate(st.session_state.attributes):
+            with tabs[i]:
+                # Get the matrix for this attribute
+                matrix = st.session_state.attribute_matrices[attr["name"]]
+                
+                # Calculate weights for this attribute
+                weights = solve_pcm_geometric_mean(np.array(matrix))
+                
+                # Display the weights as a bar chart
+                item_weights_df = pd.DataFrame({
+                    "Item": [f"Item {j+1}" for j in range(len(st.session_state.items))],
+                    "Weight": weights
+                })
+                
+                st.subheader(f"Weights for {attr['name']}")
+                st.bar_chart(item_weights_df.set_index("Item"))
+                
+                # Display the pairwise comparison matrix
+                with st.expander(f"View Pairwise Comparison Matrix for {attr['name']}"):
+                    item_labels = [f"Item {j+1}" for j in range(len(st.session_state.items))]
+                    pcm_df = pd.DataFrame(matrix, index=item_labels, columns=item_labels)
+                    st.dataframe(pcm_df.style.format("{:.2f}"))
+    
+    # Display final AHP scores
+    if st.session_state.ahp_scores:
+        st.header("AHP Results")
+        
+        # Format scores for display
+        items = st.session_state.items
+        scores = st.session_state.ahp_scores
+        
+        # Create a DataFrame with items and scores
+        results_df = pd.DataFrame({
+            "Item #": [f"Item {i+1}" for i in range(len(items))],
+            "Item Text": [item[:100] + "..." if len(item) > 100 else item for item in items],
+            "AHP Score": [scores[i] for i in range(len(items))]
+        })
+        
+        # Sort by score descending
+        results_df = results_df.sort_values("AHP Score", ascending=False)
+        
+        # Display as a table
+        st.dataframe(results_df.style.format({"AHP Score": "{:.4f}"}), hide_index=True)
+        
+        # Display as a bar chart
+        chart_df = pd.DataFrame({
+            "Item": [f"Item {i+1}" for i in range(len(items))],
+            "Score": [scores[i] for i in range(len(items))]
+        })
+        chart_df = chart_df.sort_values("Score", ascending=False)
+        
+        st.bar_chart(chart_df.set_index("Item"))
+        
+        # Display the top ranked items with full text
+        st.subheader("Top Ranked Items")
+        
+        # Get the indices of the top 3 items (or fewer if there aren't 3)
+        top_count = min(3, len(items))
+        
+        # Get the indices sorted by score
+        sorted_indices = sorted(range(len(items)), key=lambda i: scores[i], reverse=True)
+        
+        # Display the top items
+        for rank, idx in enumerate(sorted_indices[:top_count]):
+            with st.container(border=True):
+                st.markdown(f"#### {rank+1}. Item {idx+1} (Score: {scores[idx]:.4f})")
+                st.markdown(f"_{items[idx]}_")
+        
+        # Show all items in an expander
+        with st.expander("View All Items Ranked"):
+            for rank, idx in enumerate(sorted_indices):
+                st.markdown(f"**{rank+1}. Item {idx+1} (Score: {scores[idx]:.4f})**")
+                st.markdown(f"{items[idx]}")
+                st.markdown("---")
+    
+    # Compare AHP with direct ranking
+    if st.session_state.ahp_scores and st.session_state.direct_scores:
+        st.header("AHP vs Direct Ranking Comparison")
+        
+        items = st.session_state.items
+        ahp_scores = st.session_state.ahp_scores
+        direct_scores = st.session_state.direct_scores
+        
+        # Create comparison DataFrame
+        comparison_df = pd.DataFrame({
+            "Item #": [f"Item {i+1}" for i in range(len(items))],
+            "Item Text": [item[:100] + "..." if len(item) > 100 else item for item in items],
+            "AHP Score": [ahp_scores.get(i, 0) for i in range(len(items))],
+            "Direct Score": [direct_scores.get(i, 0) for i in range(len(items))]
+        })
+        
+        # Calculate difference and rank difference
+        comparison_df["Difference"] = comparison_df["AHP Score"] - comparison_df["Direct Score"]
+        
+        # Sort by AHP score
+        comparison_df = comparison_df.sort_values("AHP Score", ascending=False)
+        
+        # Display as a table
+        st.dataframe(comparison_df.style.format({
+            "AHP Score": "{:.4f}",
+            "Direct Score": "{:.4f}",
+            "Difference": "{:.4f}"
+        }), hide_index=True)
+        
+        # Display side-by-side top items
+        st.subheader("Top Items Comparison")
+        
+        # Create two columns
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### Top 3 by AHP")
+            # Get indices sorted by AHP score
+            ahp_sorted = sorted(range(len(items)), key=lambda i: ahp_scores.get(i, 0), reverse=True)
+            
+            # Display top 3 AHP items
+            for rank, idx in enumerate(ahp_sorted[:3]):
+                with st.container(border=True):
+                    st.markdown(f"**{rank+1}. Item {idx+1} (Score: {ahp_scores.get(idx, 0):.4f})**")
+                    st.markdown(f"{items[idx]}")
+        
+        with col2:
+            st.markdown("### Top 3 by Direct Ranking")
+            # Get indices sorted by direct score
+            direct_sorted = sorted(range(len(items)), key=lambda i: direct_scores.get(i, 0), reverse=True)
+            
+            # Display top 3 direct items
+            for rank, idx in enumerate(direct_sorted[:3]):
+                with st.container(border=True):
+                    st.markdown(f"**{rank+1}. Item {idx+1} (Score: {direct_scores.get(idx, 0):.4f})**")
+                    st.markdown(f"{items[idx]}")
+        
+        # Display reasoning for direct ranking
+        if hasattr(st.session_state, 'direct_reasoning') and st.session_state.direct_reasoning:
+            with st.expander("Direct Ranking Reasoning"):
+                st.write(st.session_state.direct_reasoning)
+        
+        # Display as a comparison chart
+        st.subheader("Score Comparison Chart")
+        chart_data = pd.DataFrame({
+            "Item": [f"Item {i+1}" for i in range(len(items))],
+            "AHP": [ahp_scores.get(i, 0) for i in range(len(items))],
+            "Direct": [direct_scores.get(i, 0) for i in range(len(items))]
+        })
+        
+        # Sort by AHP score
+        chart_data = chart_data.sort_values("AHP", ascending=False)
+        
+        # Reshape for charting
+        chart_data_melted = pd.melt(
+            chart_data, 
+            id_vars=["Item"], 
+            value_vars=["AHP", "Direct"],
+            var_name="Method", 
+            value_name="Score"
+        )
+        
+        # Create a grouped bar chart
+        st.bar_chart(chart_data_melted.pivot(index="Item", columns="Method", values="Score"))
+        
+        # Calculate correlation and agreement metrics
+        correlation = np.corrcoef(
+            [ahp_scores.get(i, 0) for i in range(len(items))],
+            [direct_scores.get(i, 0) for i in range(len(items))]
+        )[0, 1]
+        
+        # Calculate rank correlation (Spearman)
+        # First get the rankings (not the scores)
+        ahp_ranks = {idx: rank for rank, idx in enumerate(ahp_sorted)}
+        direct_ranks = {idx: rank for rank, idx in enumerate(direct_sorted)}
+        
+        # Calculate the sum of squared differences in ranks
+        d_squared_sum = sum((ahp_ranks.get(i, 0) - direct_ranks.get(i, 0))**2 for i in range(len(items)))
+        
+        # Calculate Spearman's rank correlation coefficient
+        n = len(items)
+        if n > 1:
+            spearman = 1 - (6 * d_squared_sum) / (n * (n**2 - 1))
+        else:
+            spearman = 1.0
+        
+        # Calculate agreement on top items
+        top_k = min(3, len(items))
+        top_ahp = set(ahp_sorted[:top_k])
+        top_direct = set(direct_sorted[:top_k])
+        agreement = len(top_ahp.intersection(top_direct)) / top_k
+        
+        # Display correlation metrics
+        st.subheader("Agreement Metrics")
+        metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+        
+        with metrics_col1:
+            st.metric("Pearson Correlation", f"{correlation:.3f}", 
+                     help="Pearson correlation between AHP and Direct scores (1.0 = perfect correlation)")
+        
+        with metrics_col2:
+            st.metric("Rank Correlation", f"{spearman:.3f}", 
+                     help="Spearman's rank correlation between AHP and Direct rankings (1.0 = identical ranking order)")
+        
+        with metrics_col3:
+            st.metric(f"Top {top_k} Agreement", f"{agreement:.0%}", 
+                     help=f"Percentage of items that appear in both top {top_k} lists")
+else:
+    st.info("Click 'Run AHP Analysis' to start the process.")
+
+# Footer
+st.markdown("---")
+st.caption("Analytic Hierarchy Process (AHP) Agent - Uses LLM to decompose complex evaluation into manageable pairwise comparisons")
