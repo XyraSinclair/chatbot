@@ -169,14 +169,8 @@ def query_llm_for_item_comparisons(items, attribute_prompt, temperature=0.3, num
     prompt_hash = hash(attribute_prompt)
     samples_hash = hash(str(num_samples))
     
-    # Load cache
-    cache = load_cache()
-    cache_key = get_cache_key(f"{prompt_hash}_{samples_hash}", items_hash)
-    
-    if cache_key in cache:
-        st.success("Using cached comparisons")
-        # Return both matrices from cache
-        return np.array(cache[cache_key]["pcm"]), np.array(cache[cache_key]["variance"])
+    # Don't use cache - always perform new comparisons
+    # (cache code is left here but disabled)
     
     st.info("Comparing items...")
     
@@ -184,16 +178,20 @@ def query_llm_for_item_comparisons(items, attribute_prompt, temperature=0.3, num
     pcm = np.ones((n, n))
     variance_matrix = np.zeros((n, n))
     
-    # Calculate total comparisons (including multiple samples)
-    total_comparisons = n * (n - 1) // 2 * num_samples
+    # Calculate total comparisons (including multiple samples, both directions)
+    total_comparisons = n * (n - 1) * num_samples
     progress_bar = st.progress(0)
     status_text = st.empty()
     comparisons_done = 0
     
     try:
-        # For each pair of items, ask LLM to compare
+        # For each pair of items (both directions), ask LLM to compare
         for i in range(n):
-            for j in range(i+1, n):
+            for j in range(n):
+                if i == j:  # Skip comparing an item to itself
+                    pcm[i, j] = 1.0  # Set diagonal to 1.0
+                    continue
+                    
                 item_a = items[i]
                 item_b = items[j]
                 
@@ -213,8 +211,8 @@ Entity A: {item_a}
 
 Entity B: {item_b}
 
-Respond with a single numerical ratio, generally between 1/9 and 9. For example, if A is 2.5 as good as B, respond with "2.5". 
-If A is .6 as good as B, respond with "0.6". If they're equal, respond with "1"."""
+Respond with a single numerical ratio. For example, if A is 2.5 times better than B, respond with "2.5". 
+If A is half as good as B, respond with "0.5". If they're equal, respond with "1"."""
 
                     response = client.chat.completions.create(
                         model="gpt-4",
@@ -272,12 +270,9 @@ If B is better than A, return a decimal like "0.5".
                 mean_ratio = np.mean(ratios)
                 var_ratio = np.var(ratios) if len(ratios) > 1 else 0.0
                 
-                # Store the mean and variance
+                # Store the mean and variance directly for this pair
                 pcm[i, j] = mean_ratio
-                pcm[j, i] = 1.0 / mean_ratio if mean_ratio != 0 else 0
-                
                 variance_matrix[i, j] = var_ratio
-                variance_matrix[j, i] = var_ratio  # Store same variance for both directions
                 
                 # Progress is already updated inside the sample loop
         
@@ -285,12 +280,8 @@ If B is better than A, return a decimal like "0.5".
         status_text.empty()
         progress_bar.empty()
         
-        # Cache the results with both matrices
-        cache[cache_key] = {
-            "pcm": pcm.tolist(),
-            "variance": variance_matrix.tolist()
-        }
-        save_cache(cache)
+        # Caching disabled 
+        # (code left here but not used)
         
         return pcm, variance_matrix
         
