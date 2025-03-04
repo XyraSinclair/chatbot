@@ -130,7 +130,7 @@ if "items" not in st.session_state:
     st.session_state["items"] = load_default_data()
 
 if "attribute_prompt" not in st.session_state:
-    st.session_state["attribute_prompt"] = "How much more utilitous is entity A than entity B for the typical Bay Area tpot rationalist?"
+    st.session_state["attribute_prompt"] = "How much more utilitous is tweet A than tweet B for the typical Bay Area tpot rationalist?"
 
 if "num_samples" not in st.session_state:
     st.session_state["num_samples"] = 3
@@ -162,7 +162,7 @@ def query_llm_for_item_comparisons(items, attribute_prompt, temperature=0.3, num
     if num_samples is None:
         num_samples = st.session_state["num_samples"]
     
-    # Generate a unique hash for this set of items, prompt, and sample count
+    # Generate a unique hash for this set of items and prompt
     items_str = json.dumps(items)
     items_hash = hash(items_str)
     prompt_hash = hash(attribute_prompt)
@@ -177,7 +177,7 @@ def query_llm_for_item_comparisons(items, attribute_prompt, temperature=0.3, num
         # Return both matrices from cache
         return np.array(cache[cache_key]["pcm"]), np.array(cache[cache_key]["variance"])
     
-    st.info(f"Comparing items with {num_samples} samples per pair...")
+    st.info("Comparing items...")
     
     n = len(items)
     pcm = np.ones((n, n))
@@ -324,7 +324,7 @@ def run_analysis():
     st.session_state["consistency_score"] = consistency_score
     st.session_state["variance_matrix"] = variance_matrix
     
-    st.success(f"Analysis completed with {num_samples} samples per pair!")
+    st.success("Analysis completed!")
 
 # Main app UI with improved styling
 st.title("🧠 Consistency Checker")
@@ -334,33 +334,14 @@ This tool tests how <b>logically consistent</b> LLMs are when making pairwise co
 </div>
 """, unsafe_allow_html=True)
 
-# Create a cleaner layout with columns
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    # Input the attribute prompt
-    st.subheader("Comparison Prompt")
-    attribute_prompt = st.text_area("", 
-                                  value=st.session_state["attribute_prompt"],
-                                  help="This prompt will be sent to the LLM for each pairwise comparison",
-                                  height=70)
-    if attribute_prompt != st.session_state["attribute_prompt"]:
-        st.session_state["attribute_prompt"] = attribute_prompt
-
-with col2:
-    # Model settings
-    st.subheader("Model Settings")
-    
-    # Number of samples per pair
-    num_samples = st.number_input(
-        "Samples per pair:",
-        min_value=1,
-        max_value=10,
-        value=st.session_state["num_samples"],
-        help="Number of times to query the LLM for each pair to measure variance"
-    )
-    if num_samples != st.session_state["num_samples"]:
-        st.session_state["num_samples"] = num_samples
+# Input the attribute prompt
+st.subheader("Comparison Prompt")
+attribute_prompt = st.text_area("", 
+                              value=st.session_state["attribute_prompt"],
+                              help="This prompt will be sent to the LLM for each pairwise comparison",
+                              height=70)
+if attribute_prompt != st.session_state["attribute_prompt"]:
+    st.session_state["attribute_prompt"] = attribute_prompt
 
 # Add a divider
 st.markdown("---")
@@ -473,53 +454,8 @@ if "matrix" in st.session_state and st.session_state["matrix"] is not None:
     # Create unified results display
     st.subheader("Comparison Matrix with Consistency Analysis")
     
-    # Display settings used for this analysis
-    st.markdown(f"**Analysis Settings:** Samples per pair = {num_samples}")
-    
-    # If we have variance information, display it
-    if "variance_matrix" in st.session_state and st.session_state["variance_matrix"] is not None:
-        with st.expander("View Variance Analysis"):
-            # Calculate average variance
-            variance_matrix = st.session_state["variance_matrix"]
-            avg_variance = np.mean(variance_matrix[np.triu_indices_from(variance_matrix, k=1)])
-            
-            st.markdown(f"**Average Variance:** {avg_variance:.4f}")
-            st.info("This represents how much the LLM's judgments varied across multiple samples for each pair. Lower values indicate more consistent responses.")
-            
-            # Create a visualization of the variance matrix
-            variance_df = pd.DataFrame(variance_matrix, index=labels, columns=labels)
-            
-            # Define a function to highlight high variance
-            def highlight_variance(val):
-                if i == j:  # Skip diagonal
-                    return 'background-color: #f0f0f0'
-                    
-                if val > 0.5:
-                    return 'background-color: #ff9999'  # Red for high variance
-                elif val > 0.2:
-                    return 'background-color: #ffcc99'  # Orange for medium variance
-                elif val > 0.05:
-                    return 'background-color: #ffffcc'  # Yellow for low variance
-                elif val > 0:
-                    return 'background-color: #ccffcc'  # Green for very low variance
-                else:
-                    return 'background-color: #f0f0f0'  # Gray for zero variance
-            
-            # Display the variance matrix
-            st.subheader("Variance Matrix")
-            st.dataframe(
-                variance_df.style.format("{:.4f}").applymap(lambda x: f"background-color: {'#ff9999' if x > 0.5 else '#ffcc99' if x > 0.2 else '#ffffcc' if x > 0.05 else '#ccffcc' if x > 0 else '#f0f0f0'}"),
-                use_container_width=True
-            )
-            
-            # Add variance legend
-            st.markdown("""
-            **Variance Legend:**
-            - <span style='background-color: #ccffcc; padding: 2px 5px;'>Green</span>: Very low variance (< 0.05)
-            - <span style='background-color: #ffffcc; padding: 2px 5px;'>Yellow</span>: Low variance (0.05 - 0.2)
-            - <span style='background-color: #ffcc99; padding: 2px 5px;'>Orange</span>: Medium variance (0.2 - 0.5)
-            - <span style='background-color: #ff9999; padding: 2px 5px;'>Red</span>: High variance (> 0.5)
-            """, unsafe_allow_html=True)
+    # Display model description
+    st.markdown("**Using GPT-4 for analysis**")
     
     # Calculate log differences for color coding
     diff_matrix = np.zeros_like(matrix)
@@ -556,14 +492,27 @@ if "matrix" in st.session_state and st.session_state["matrix"] is not None:
                 # Format the number with 3 decimal places
                 cell_value = f"{val:.3f}"
                 
-                # Choose background color based on deviation from ideal
+                # Choose background color based on deviation from ideal - more gradual coloring
                 if i != j:  # Skip diagonal
-                    if diff > 0.5:
-                        bg_color = '#ff9999'  # Red for large inconsistency
+                    # Create a more gradual color scale
+                    if diff > 0.9:
+                        bg_color = '#ff6666'  # Bright red for very large inconsistency
+                    elif diff > 0.7:
+                        bg_color = '#ff8080'  # Red for large inconsistency
+                    elif diff > 0.5:
+                        bg_color = '#ff9999'  # Light red
+                    elif diff > 0.4:
+                        bg_color = '#ffb399'  # Red-orange
+                    elif diff > 0.3:
+                        bg_color = '#ffcc99'  # Orange
                     elif diff > 0.2:
-                        bg_color = '#ffcc99'  # Orange for medium inconsistency
+                        bg_color = '#ffe699'  # Dark yellow
+                    elif diff > 0.15:
+                        bg_color = '#ffffb3'  # Yellow
                     elif diff > 0.1:
-                        bg_color = '#ffffcc'  # Yellow for small inconsistency
+                        bg_color = '#ffffcc'  # Light yellow
+                    elif diff > 0.05:
+                        bg_color = '#e6ffcc'  # Yellow-green
                     else:
                         bg_color = '#ccffcc'  # Green for consistent
                 else:
@@ -586,79 +535,6 @@ if "matrix" in st.session_state and st.session_state["matrix"] is not None:
         use_container_width=True
     )
     
-    # Add legend for color coding
-    st.markdown("""
-    **Color Legend:**
-    - <span style='background-color: #ccffcc; padding: 2px 5px;'>Green</span>: Highly consistent (< 0.1 difference)
-    - <span style='background-color: #ffffcc; padding: 2px 5px;'>Yellow</span>: Slightly inconsistent (0.1 - 0.2 difference)
-    - <span style='background-color: #ffcc99; padding: 2px 5px;'>Orange</span>: Moderately inconsistent (0.2 - 0.5 difference)
-    - <span style='background-color: #ff9999; padding: 2px 5px;'>Red</span>: Highly inconsistent (> 0.5 difference)
-    """, unsafe_allow_html=True)
-    
-    # Display the weights as a bar chart
-    st.subheader("Entity Weights Visualization")
-    st.bar_chart(weight_df)
-    
-    # Optional: Show the tabs for detailed view
-    with st.expander("Show Detailed Matrices"):
-        tab1, tab2 = st.tabs(["Ideal Consistent Matrix", "Difference Matrix"])
-        
-        with tab1:
-            # Convert to pandas DataFrame for better display
-            df_perfect = pd.DataFrame(perfect_matrix, index=labels, columns=labels)
-            st.dataframe(df_perfect.style.format("{:.3f}"), use_container_width=True)
-            st.info("This matrix shows what a perfectly consistent matrix would look like based on the calculated weights.")
-            
-        with tab2:
-            # Calculate difference matrix
-            diff_matrix_display = matrix - perfect_matrix
-            
-            # Convert to pandas DataFrame for better display
-            df_diff = pd.DataFrame(diff_matrix_display, index=labels, columns=labels)
-            
-            # Custom formatting for differences
-            def highlight_diff(val):
-                color = 'white'
-                if abs(val) > 1.0:
-                    color = '#ff9999'  # red
-                elif abs(val) > 0.5:
-                    color = '#ffcc99'  # orange
-                elif abs(val) > 0.1:
-                    color = '#ffffcc'  # yellow
-                return f'background-color: {color}'
-            
-            st.dataframe(df_diff.style.format("{:.3f}").applymap(highlight_diff), use_container_width=True)
-            st.info("This shows the difference between the LLM's judgments and what would be perfectly consistent judgments.")
-    
-    # Removed Inconsistency Details section
-    
-    # Explain inconsistency
-    with st.expander("Understanding Consistency in Pairwise Comparisons"):
-        st.markdown("""
-        ### What is Consistency?
-        
-        In pairwise comparisons, consistency means that your judgments follow logical transitivity. For example:
-        
-        - If A is 2 times better than B, and
-        - B is 3 times better than C, then
-        - A should be 6 times better than C (2 × 3)
-        
-        ### How to Read the Consistency Score
-        
-        The consistency score measures how much the LLM's judgments deviate from perfect logical consistency:
-        
-        - **< 0.1:** Highly consistent judgments
-        - **0.1 - 0.2:** Moderately consistent with some inconsistencies
-        - **> 0.2:** Significantly inconsistent judgments
-        
-        ### Why Inconsistency Happens
-        
-        Inconsistency in LLM judgments can occur because:
-        
-        1. The LLM may focus on different aspects when making different comparisons
-        2. The LLM lacks a global view of all its judgments
-        3. Even humans make inconsistent judgments for complex comparisons
-        """)
 
 # Footer
 st.markdown("---")
