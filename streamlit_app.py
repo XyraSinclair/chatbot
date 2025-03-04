@@ -17,6 +17,7 @@ st.set_page_config(
     layout="wide"
 )
 
+
 # Define the geometric mean PCM solver
 def solve_pcm_geometric_mean(pcm):
     """
@@ -212,8 +213,8 @@ Entity A: {item_a}
 
 Entity B: {item_b}
 
-Respond with a single numerical ratio. For example, if A is 2.5 as good as B, respond with "2". 
-If A is half as good as B, respond with "0.5". If they're equal, respond with "1"."""
+Respond with a single numerical ratio, generally between 1/9 and 9. For example, if A is 2.5 as good as B, respond with "2.5". 
+If A is .6 as good as B, respond with "0.6". If they're equal, respond with "1"."""
 
                     response = client.chat.completions.create(
                         model="gpt-4",
@@ -329,10 +330,8 @@ def run_analysis():
 # Main app UI with improved styling
 st.title("🧠 Consistency Checker")
 st.markdown("""
-<div style="background-color: #f0f7ff; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
-This tool tests how <b>logically consistent</b> LLMs are when making pairwise comparisons between different entities.
-</div>
-""", unsafe_allow_html=True)
+This tool tests how **logically consistent** LLMs are when making pairwise comparisons between different entities.
+""")
 
 # Input the attribute prompt
 st.subheader("Comparison Prompt")
@@ -422,30 +421,24 @@ if "matrix" in st.session_state and st.session_state["matrix"] is not None:
     # Create nice labels using letters (A, B, C...)
     labels = [chr(65 + i) for i in range(len(items))]
     
-    # Show consistency score with explanation
-    score_color = "green" if consistency_score < 0.1 else "orange" if consistency_score < 0.2 else "red"
-    st.markdown(f"### Consistency Score: <span style='color:{score_color}'>{consistency_score:.3f}</span>", unsafe_allow_html=True)
+    # Simple consistency score display
+    st.subheader(f"Consistency Score: {consistency_score:.3f}")
     
-    # Interpret the score
+    # Simple interpretation of the score
     if consistency_score < 0.1:
-        st.success("The LLM's judgments are highly consistent!")
+        st.success("The judgments are highly consistent.")
     elif consistency_score < 0.2:
-        st.warning("The LLM's judgments have some inconsistencies.")
+        st.warning("The judgments have some inconsistencies.")
     else:
-        st.error("The LLM's judgments are significantly inconsistent.")
+        st.error("The judgments are significantly inconsistent.")
         
-    # Explain the consistency score calculation
+    # Simple explanation of the score
     st.info("""
-    **What this score means:**
+    **Consistency Score:**
     
-    The consistency score measures how well the LLM's pairwise comparisons align with perfect mathematical consistency.
-    
-    - **0.0** would be perfect consistency (impossible in practice)
-    - **< 0.1** indicates excellent consistency
-    - **0.1 - 0.2** indicates acceptable consistency
-    - **> 0.2** indicates concerning inconsistency
-    
-    *Technical explanation:* This score is calculated as the average logarithmic difference between the actual pairwise ratios and what they would be in a perfectly consistent matrix derived from the calculated weights. Smaller values indicate better consistency.
+    - **0.0 - 0.1**: Excellent consistency
+    - **0.1 - 0.2**: Acceptable consistency
+    - **> 0.2**: Poor consistency
     """)
     
     # Calculate weights using geometric mean method
@@ -492,37 +485,22 @@ if "matrix" in st.session_state and st.session_state["matrix"] is not None:
                 # Format the number with 3 decimal places
                 cell_value = f"{val:.3f}"
                 
-                # Choose background color based on deviation from ideal - more gradual coloring
+                # Simple color coding based on consistency
                 if i != j:  # Skip diagonal
-                    # Create a more gradual color scale
-                    if diff > 0.9:
-                        bg_color = '#ff6666'  # Bright red for very large inconsistency
-                    elif diff > 0.7:
-                        bg_color = '#ff8080'  # Red for large inconsistency
-                    elif diff > 0.5:
-                        bg_color = '#ff9999'  # Light red
-                    elif diff > 0.4:
-                        bg_color = '#ffb399'  # Red-orange
-                    elif diff > 0.3:
-                        bg_color = '#ffcc99'  # Orange
-                    elif diff > 0.2:
-                        bg_color = '#ffe699'  # Dark yellow
-                    elif diff > 0.15:
-                        bg_color = '#ffffb3'  # Yellow
+                    if diff > 0.3:
+                        bg_color = '#ffcccc'  # Light red for inconsistent
                     elif diff > 0.1:
-                        bg_color = '#ffffcc'  # Light yellow
-                    elif diff > 0.05:
-                        bg_color = '#e6ffcc'  # Yellow-green
+                        bg_color = '#ffffcc'  # Light yellow for somewhat inconsistent
                     else:
-                        bg_color = '#ccffcc'  # Green for consistent
+                        bg_color = '#ccffcc'  # Light green for consistent
                 else:
                     bg_color = '#f0f0f0'  # Gray for diagonal
                 
-                styled.iloc[i, j] = f'background-color: {bg_color}'
+                styled.iloc[i, j] = f'background-color: {bg_color}; color: black;'
                 
         # Format the weights column
         for i in range(len(labels)):
-            styled.iloc[i, -1] = 'background-color: #e6f3ff; font-weight: bold'
+            styled.iloc[i, -1] = 'background-color: #f0f0f0; color: black; font-weight: bold'
             
         return styled
     
