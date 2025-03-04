@@ -5,8 +5,6 @@ from openai import OpenAI
 import json
 import os
 import re
-import time
-from typing import Dict, List, Tuple, Any, Optional
 
 # Initialize OpenAI client
 openai_api_key = st.secrets.openai_api_key
@@ -14,8 +12,8 @@ client = OpenAI(api_key=openai_api_key)
 
 # Configure the page
 st.set_page_config(
-    page_title="Analytic Hierarchy Process (AHP) Agent",
-    page_icon="📊",
+    page_title="Consistency Checker",
+    page_icon="🧮",
     layout="wide"
 )
 
@@ -44,38 +42,70 @@ def solve_pcm_geometric_mean(pcm):
     # Normalize the weights to sum to 1
     return weights / np.sum(weights)
 
+# Calculate inconsistency ratio
+def calculate_consistency(pcm):
+    """
+    Calculate the consistency ratio of a pairwise comparison matrix
+    
+    Args:
+        pcm: A square numpy matrix of pairwise comparison ratios
+        
+    Returns:
+        consistency_ratio: A measure of the inconsistency of the matrix
+        perfect_matrix: An ideally consistent matrix based on the eigenvector weights
+    """
+    n = len(pcm)
+    
+    # Calculate weights using geometric mean method
+    weights = solve_pcm_geometric_mean(pcm)
+    
+    # Create a perfectly consistent matrix based on the weights
+    perfect_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            perfect_matrix[i, j] = weights[i] / weights[j]
+    
+    # Calculate the log differences for each cell
+    log_diffs = []
+    for i in range(n):
+        for j in range(i+1, n):  # Only upper triangle
+            if pcm[i, j] > 0 and perfect_matrix[i, j] > 0:
+                log_diff = abs(np.log10(pcm[i, j]) - np.log10(perfect_matrix[i, j]))
+                log_diffs.append(log_diff)
+    
+    # Calculate the mean log difference
+    if log_diffs:
+        consistency_score = np.mean(log_diffs)
+    else:
+        consistency_score = 0
+    
+    return consistency_score, perfect_matrix
+
 # Cache configuration
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-def get_cache_file(prefix=""):
-    """Get the cache file path with optional prefix"""
-    return os.path.join(CACHE_DIR, f"{prefix}_ahp_cache.json")
+def get_cache_file():
+    """Get the cache file path"""
+    return os.path.join(CACHE_DIR, "consistency_cache.json")
 
-def load_cache(prefix=""):
+def load_cache():
     """Load the cache from file or return empty cache if file doesn't exist"""
-    cache_file = get_cache_file(prefix)
+    cache_file = get_cache_file()
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             return json.load(f)
     return {}
 
-def save_cache(cache, prefix=""):
+def save_cache(cache):
     """Save the cache to file"""
-    cache_file = get_cache_file(prefix)
+    cache_file = get_cache_file()
     with open(cache_file, 'w') as f:
         json.dump(cache, f, indent=2)
 
-def get_cache_key(i, j):
-    """Generate a consistent cache key for item pair comparison"""
-    return f"{i}_{j}"
-
-def get_cached_comparison(cache, attribute, i, j):
-    """Get a cached comparison if it exists"""
-    if attribute not in cache:
-        return None
-    cache_key = get_cache_key(i, j)
-    return cache[attribute].get("item_pairs", {}).get(cache_key)
+def get_cache_key(prompt_hash, items_hash):
+    """Generate a cache key for a set of items and comparison prompt"""
+    return f"{prompt_hash}_{items_hash}"
 
 # Load default tweets from data.json
 def load_default_data():
@@ -84,213 +114,77 @@ def load_default_data():
         with open('data.json', 'r') as f:
             data = json.load(f)
             tweets = data.get('tweets', [])
-            return tweets
+            return tweets[:5]  # Just take 5 items for simplicity
     except Exception as e:
         st.error(f"Error loading data: {e}")
-        return []
-
-# Initialize state for items
-if "items" not in st.session_state:
-    st.session_state.items = load_default_data()
-
-if "goal" not in st.session_state:
-    st.session_state.goal = "Find the relative utilities of me reading these tweets"
-
-if "attributes" not in st.session_state:
-    st.session_state.attributes = []
-
-if "attribute_weights" not in st.session_state:
-    st.session_state.attribute_weights = {}
-    
-if "attribute_matrices" not in st.session_state:
-    st.session_state.attribute_matrices = {}
-    
-if "ahp_scores" not in st.session_state:
-    st.session_state.ahp_scores = {}
-    
-if "direct_scores" not in st.session_state:
-    st.session_state.direct_scores = {}
-
-def query_llm_for_attributes(items, goal, num_attributes=5):
-    """
-    Query the LLM to generate attributes for evaluation based on the goal
-    """
-    cache = load_cache("attributes")
-    cache_key = f"{goal}_{len(items)}"
-    
-    if cache_key in cache:
-        st.success("Using cached attributes")
-        return cache[cache_key]
-    
-    # Get a sample of items (if many) to avoid token limits
-    sample_items = items[:5] if len(items) > 5 else items
-    
-    st.info("Generating attributes based on goal...")
-    
-    try:
-        prompt = f"""You are an analytic hierarchy process agent. You are interested in this goal: {goal}.
-
-Below are some sample items that users will be evaluating:
-
-{json.dumps(sample_items, indent=2)}
-
-Based on the goal and these items, come up with {num_attributes} attributes that would be relevant for evaluation. 
-For each attribute:
-1. Provide a clear name
-2. Provide a description
-3. Provide a comparison prompt (e.g., "How much more [attribute] is item A compared to item B?")
-
-Format your response as a JSON array with objects containing 'name', 'description', and 'prompt' fields. 
-The attributes should be diverse and capture different aspects relevant to the goal.
-"""
-
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant skilled in designing evaluation frameworks."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=1000,
-            response_format={"type": "json_object"}
-        )
-        
-        result = json.loads(response.choices[0].message.content)
-        attributes = result.get("attributes", [])
-        
-        # Cache the results
-        cache[cache_key] = attributes
-        save_cache(cache, "attributes")
-        
-        return attributes
-        
-    except Exception as e:
-        st.error(f"Error generating attributes: {e}")
-        # Fallback to default attributes
         return [
-            {
-                "name": "relevance",
-                "description": "How relevant the item is to the goal",
-                "prompt": "How much more relevant to the goal is item A than item B?"
-            },
-            {
-                "name": "impact",
-                "description": "The potential impact of the item",
-                "prompt": "How much more impactful is item A than item B?"
-            },
-            {
-                "name": "quality",
-                "description": "The overall quality of the item",
-                "prompt": "How much higher quality is item A than item B?"
-            }
+            "meditation and mindfulness practices",
+            "reading philosophy books",
+            "going for long walks in nature",
+            "engaging in deep conversations",
+            "journaling about personal insights"
         ]
 
-def query_llm_for_attribute_comparisons(attributes, goal):
-    """
-    Query the LLM to do pairwise comparisons of attributes
-    Returns a pairwise comparison matrix for the attributes
-    """
-    cache = load_cache("attribute_weights")
-    attributes_key = "+".join([attr["name"] for attr in attributes]) + "_" + goal
-    
-    if attributes_key in cache:
-        st.success("Using cached attribute weights")
-        return cache[attributes_key]
-    
-    st.info("Comparing attributes based on goal...")
-    
-    n = len(attributes)
-    pcm = np.ones((n, n))
-    
-    try:
-        # For each pair of attributes, ask LLM to compare
-        for i in range(n):
-            for j in range(i+1, n):
-                attr_a = attributes[i]
-                attr_b = attributes[j]
-                
-                prompt = f"""In the context of this goal: "{goal}"
+# Initialize session state
+if "items" not in st.session_state:
+    st.session_state["items"] = load_default_data()
 
-I need to compare the relative importance of two attributes:
+if "attribute_prompt" not in st.session_state:
+    st.session_state["attribute_prompt"] = "How much more utilitous is entity A than entity B for the typical Bay Area tpot rationalist?"
 
-Attribute A: {attr_a['name']} - {attr_a['description']}
-Attribute B: {attr_b['name']} - {attr_b['description']}
+if "num_samples" not in st.session_state:
+    st.session_state["num_samples"] = 3
 
-How much more important is Attribute A compared to Attribute B for achieving the goal?
-Express your answer as a single ratio number.
-- If A is twice as important as B, respond with "2"
-- If A is slightly more important than B, respond with a value between 1 and 2 (e.g., "1.5")
-- If A and B are equally important, respond with "1"
-- If B is more important than A, respond with a value less than 1 (e.g., "0.5" if B is twice as important as A)
+if "matrix" not in st.session_state:
+    st.session_state["matrix"] = None
 
-Provide only the numerical value with no additional text."""
+if "consistency_score" not in st.session_state:
+    st.session_state["consistency_score"] = None
 
-                response = client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant skilled in analytical decision making."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=10
-                )
-                
-                try:
-                    ratio = float(response.choices[0].message.content.strip())
-                    pcm[i, j] = ratio
-                    pcm[j, i] = 1.0 / ratio
-                except ValueError:
-                    st.warning(f"Could not parse response for {attr_a['name']} vs {attr_b['name']}, using default value of 1")
-                    pcm[i, j] = 1.0
-                    pcm[j, i] = 1.0
-        
-        # Cache the results
-        cache[attributes_key] = pcm.tolist()
-        save_cache(cache, "attribute_weights")
-        
-        return pcm.tolist()
-        
-    except Exception as e:
-        st.error(f"Error comparing attributes: {e}")
-        # Return identity matrix as fallback
-        return np.ones((n, n)).tolist()
+if "perfect_matrix" not in st.session_state:
+    st.session_state["perfect_matrix"] = None
 
-def query_llm_for_item_comparisons(items, attribute):
+if "variance_matrix" not in st.session_state:
+    st.session_state["variance_matrix"] = None
+
+def query_llm_for_item_comparisons(items, attribute_prompt, temperature=0.3, num_samples=None):
     """
     Query the LLM to do pairwise comparisons of items for a specific attribute
-    Returns a pairwise comparison matrix for the items
+    Returns a pairwise comparison matrix for the items and a variance matrix
+    
+    Args:
+        items: List of items to compare
+        attribute_prompt: The prompt to use for comparison
+        temperature: Temperature setting for the LLM (default: 0.3)
+        num_samples: Number of times to query per pair (uses session state if None)
     """
-    cache = load_cache("item_comparisons")
-    cache_key = attribute["name"]
+    # Use the provided num_samples or get from session state
+    if num_samples is None:
+        num_samples = st.session_state["num_samples"]
     
-    if cache_key in cache and len(cache[cache_key].get("item_pairs", {})) >= (len(items) * (len(items) - 1)):
-        st.success(f"Using cached comparisons for {attribute['name']}")
-        
-        # Reconstruct the matrix from cache
-        n = len(items)
-        pcm = np.ones((n, n))
-        
-        for i in range(n):
-            for j in range(i+1, n):
-                pair_key = get_cache_key(i, j)
-                if pair_key in cache[cache_key]["item_pairs"]:
-                    ratio = cache[cache_key]["item_pairs"][pair_key]
-                    pcm[i, j] = ratio
-                    pcm[j, i] = 1.0 / ratio if ratio != 0 else 0
-        
-        return pcm.tolist()
+    # Generate a unique hash for this set of items, prompt, and sample count
+    items_str = json.dumps(items)
+    items_hash = hash(items_str)
+    prompt_hash = hash(attribute_prompt)
+    samples_hash = hash(str(num_samples))
     
-    # Initialize cache structure for this attribute if it doesn't exist
-    if cache_key not in cache:
-        cache[cache_key] = {"item_pairs": {}}
+    # Load cache
+    cache = load_cache()
+    cache_key = get_cache_key(f"{prompt_hash}_{samples_hash}", items_hash)
     
-    st.info(f"Comparing items based on {attribute['name']}...")
+    if cache_key in cache:
+        st.success("Using cached comparisons")
+        # Return both matrices from cache
+        return np.array(cache[cache_key]["pcm"]), np.array(cache[cache_key]["variance"])
+    
+    st.info(f"Comparing items with {num_samples} samples per pair...")
     
     n = len(items)
     pcm = np.ones((n, n))
+    variance_matrix = np.zeros((n, n))
     
-    # Calculate total comparisons
-    total_comparisons = n * (n - 1) // 2
+    # Calculate total comparisons (including multiple samples)
+    total_comparisons = n * (n - 1) // 2 * num_samples
     progress_bar = st.progress(0)
     status_text = st.empty()
     comparisons_done = 0
@@ -302,524 +196,470 @@ def query_llm_for_item_comparisons(items, attribute):
                 item_a = items[i]
                 item_b = items[j]
                 
-                # Check if comparison is already cached
-                pair_key = get_cache_key(i, j)
-                if pair_key in cache[cache_key]["item_pairs"]:
-                    ratio = cache[cache_key]["item_pairs"][pair_key]
-                    status_text.text(f"Using cached comparison for Item {i+1} with Item {j+1}")
-                else:
-                    status_text.text(f"Comparing Item {i+1} with Item {j+1} for {attribute['name']}...")
+                # Use letters (A, B, C...) instead of numbers
+                label_i = chr(65 + i)
+                label_j = chr(65 + j)
+                
+                # Collect multiple samples for this pair
+                ratios = []
+                
+                for sample_idx in range(num_samples):
+                    status_text.text(f"Comparing Entity {label_i} with Entity {label_j} (Sample {sample_idx+1}/{num_samples})...")
                     
-                    prompt = f"""{attribute['prompt']}
+                    prompt = f"""{attribute_prompt}
 
-Item A: {item_a}
+Entity A: {item_a}
 
-Item B: {item_b}
+Entity B: {item_b}
 
-Respond with a single numerical ratio. For example, if A is twice as good as B, respond with "2". 
+Respond with a single numerical ratio. For example, if A is 2.5 as good as B, respond with "2". 
 If A is half as good as B, respond with "0.5". If they're equal, respond with "1"."""
 
                     response = client.chat.completions.create(
                         model="gpt-4",
                         messages=[
-                            {"role": "system", "content": "You are a helpful assistant that evaluates relative properties of items."},
+                            {"role": "system", "content": "You are a helpful assistant that evaluates relative properties of items. You MUST respond with ONLY a numerical ratio, with no explanations or additional text. Just return the number."},
                             {"role": "user", "content": prompt}
                         ],
-                        temperature=0.3,
-                        max_tokens=10
+                        temperature=temperature,
+                        max_tokens=50
                     )
                     
                     try:
-                        ratio = float(response.choices[0].message.content.strip())
-                        # Cache the result
-                        cache[cache_key]["item_pairs"][pair_key] = ratio
-                        cache[cache_key]["item_pairs"][get_cache_key(j, i)] = 1.0 / ratio if ratio != 0 else 0
-                        save_cache(cache, "item_comparisons")
-                    except ValueError:
-                        st.warning(f"Could not parse response for comparison of items {i+1} and {j+1}, using default value of 1")
+                        # First attempt to parse directly
+                        raw_response = response.choices[0].message.content.strip()
+                        try:
+                            ratio = float(raw_response)
+                        except ValueError:
+                            # If direct parsing fails, make a second LLM call to extract just the number
+                            extraction_prompt = f"""Extract ONLY the numerical ratio from this response. Return ONLY the number, with no other text:
+
+{raw_response}
+
+For example, if the response contains "I think A is 2.5 times better than B", just return "2.5".
+If the response indicates equality, return "1".
+If B is better than A, return a decimal like "0.5".
+"""
+
+                            extraction_response = client.chat.completions.create(
+                                model="gpt-4", 
+                                messages=[
+                                    {"role": "system", "content": "You extract numerical values from text."},
+                                    {"role": "user", "content": extraction_prompt}
+                                ],
+                                temperature=min(0.1, temperature),  # Always keep this very low for extracting numbers
+                                max_tokens=10
+                            )
+                            
+                            ratio = float(extraction_response.choices[0].message.content.strip())
+                            
+                            # Log the extra call that was needed
+                            st.info(f"Needed to extract number from: '{raw_response}'")
+                            
+                    except ValueError as e:
+                        st.warning(f"Could not parse response for comparison of entities {label_i} and {label_j}, using default value of 1. Error: {e}")
                         ratio = 1.0
+                    
+                    # Store this sample's ratio
+                    ratios.append(ratio)
+                    
+                    # Update progress
+                    comparisons_done += 1
+                    progress_bar.progress(comparisons_done / total_comparisons)
                 
-                pcm[i, j] = ratio
-                pcm[j, i] = 1.0 / ratio if ratio != 0 else 0
+                # Calculate the mean and variance
+                mean_ratio = np.mean(ratios)
+                var_ratio = np.var(ratios) if len(ratios) > 1 else 0.0
                 
-                # Update progress
-                comparisons_done += 1
-                progress_bar.progress(comparisons_done / total_comparisons)
+                # Store the mean and variance
+                pcm[i, j] = mean_ratio
+                pcm[j, i] = 1.0 / mean_ratio if mean_ratio != 0 else 0
+                
+                variance_matrix[i, j] = var_ratio
+                variance_matrix[j, i] = var_ratio  # Store same variance for both directions
+                
+                # Progress is already updated inside the sample loop
         
         # Clear status text and progress bar when done
         status_text.empty()
         progress_bar.empty()
         
-        return pcm.tolist()
+        # Cache the results with both matrices
+        cache[cache_key] = {
+            "pcm": pcm.tolist(),
+            "variance": variance_matrix.tolist()
+        }
+        save_cache(cache)
+        
+        return pcm, variance_matrix
         
     except Exception as e:
-        st.error(f"Error comparing items for {attribute['name']}: {e}")
-        # Return identity matrix as fallback
-        return np.ones((n, n)).tolist()
+        st.error(f"Error comparing items: {e}")
+        # Return identity matrices as fallback
+        return np.ones((n, n)), np.zeros((n, n))
 
-def calculate_ahp_scores(items, attributes, attribute_weights, item_matrices):
+def run_analysis():
     """
-    Calculate the final AHP scores for each item
+    Run the consistency analysis for the attribute and items
     """
-    n_items = len(items)
-    n_attrs = len(attributes)
+    items = st.session_state["items"]
+    attribute_prompt = st.session_state["attribute_prompt"]
+    num_samples = st.session_state["num_samples"]
     
-    # Calculate the weight for each attribute
-    attr_weights = solve_pcm_geometric_mean(np.array(attribute_weights))
-    
-    # Calculate item scores for each attribute
-    item_scores = np.zeros((n_attrs, n_items))
-    for i, attr in enumerate(attributes):
-        # Get the item matrix for this attribute
-        item_matrix = item_matrices[attr["name"]]
-        # Calculate weights using geometric mean
-        item_scores[i] = solve_pcm_geometric_mean(np.array(item_matrix))
-    
-    # Final scores are weighted sum of attribute scores
-    final_scores = np.zeros(n_items)
-    for i in range(n_items):
-        for j in range(n_attrs):
-            final_scores[i] += attr_weights[j] * item_scores[j, i]
-    
-    # Return normalized scores (sum to 1)
-    return final_scores / np.sum(final_scores)
-
-def query_llm_for_direct_ranking(items, goal):
-    """
-    Query the LLM to directly rank the items based on the goal
-    """
-    cache = load_cache("direct_ranking")
-    items_hash = str(hash(str(items) + goal))
-    
-    if items_hash in cache:
-        st.success("Using cached direct ranking")
-        return cache[items_hash]
-    
-    st.info("Getting direct ranking of items...")
-    
-    try:
-        prompt = f"""Please directly rank the following items based on this goal: "{goal}"
-
-Items to rank:
-{json.dumps(items, indent=2)}
-
-For each item, assign a utility score from 0 to 100, where 100 is the highest possible utility. 
-Think step by step about how each item contributes to the goal.
-
-Format your response as a JSON object with the following structure:
-{{
-  "scores": {{
-    "0": 85,
-    "1": 62,
-    ...
-  }},
-  "reasoning": "Detailed explanation of your reasoning, especially for the top 3 ranked items."
-}}
-
-Where the keys in the "scores" object are the item indices (starting from 0).
-"""
-
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant skilled in analytical decision making."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=1500,
-            response_format={"type": "json_object"}
-        )
-        
-        result = json.loads(response.choices[0].message.content)
-        
-        # Extract scores and reasoning
-        scores = {}
-        reasoning = ""
-        
-        # Handle different possible JSON structures
-        if "scores" in result:
-            scores = result["scores"]
-        elif isinstance(result, dict) and all(k.isdigit() for k in result.keys()):
-            # Handle case where the model returned just the scores object directly
-            scores = result
-        
-        if "reasoning" in result:
-            reasoning = result["reasoning"]
-        
-        # Convert string keys to integers if needed
-        scores_dict = {int(k): float(v) for k, v in scores.items()}
-        
-        # Normalize scores to sum to 1
-        total = sum(scores_dict.values())
-        if total > 0:  # Prevent division by zero
-            normalized_scores = {k: v/total for k, v in scores_dict.items()}
-        else:
-            normalized_scores = scores_dict
-        
-        # Cache the results
-        cache[items_hash] = {"scores": normalized_scores, "reasoning": reasoning}
-        save_cache(cache, "direct_ranking")
-        
-        return {"scores": normalized_scores, "reasoning": reasoning}
-        
-    except Exception as e:
-        st.error(f"Error getting direct ranking: {e}")
-        # Return empty dict as fallback
-        return {"scores": {}, "reasoning": ""}
-
-def run_ahp_analysis():
-    """
-    Run the complete AHP analysis process
-    """
-    items = st.session_state.items
-    goal = st.session_state.goal
-    
-    if not items:
-        st.error("Please add some items to evaluate")
+    if not items or len(items) < 2:
+        st.error("Please provide at least 2 items to compare")
         return
     
-    with st.spinner("Running AHP analysis..."):
-        # Step 1: Generate attributes
-        attributes = query_llm_for_attributes(items, goal)
-        st.session_state.attributes = attributes
-        
-        # Step 2: Compare attributes
-        attribute_matrix = query_llm_for_attribute_comparisons(attributes, goal)
-        st.session_state.attribute_weights = attribute_matrix
-        
-        # Step 3: For each attribute, compare items
-        item_matrices = {}
-        for attr in attributes:
-            item_matrix = query_llm_for_item_comparisons(items, attr)
-            item_matrices[attr["name"]] = item_matrix
-        
-        st.session_state.attribute_matrices = item_matrices
-        
-        # Step 4: Calculate AHP scores
-        ahp_scores = calculate_ahp_scores(items, attributes, attribute_matrix, item_matrices)
-        st.session_state.ahp_scores = {i: score for i, score in enumerate(ahp_scores)}
-        
-        # Step 5: Get direct ranking for comparison
-        direct_result = query_llm_for_direct_ranking(items, goal)
-        st.session_state.direct_scores = direct_result["scores"]
-        st.session_state.direct_reasoning = direct_result.get("reasoning", "")
-    
-    st.success("AHP analysis completed!")
-
-# Main app UI
-st.title("Analytic Hierarchy Process (AHP) Agent")
-st.write("This app uses the Analytic Hierarchy Process to evaluate and rank items based on multiple criteria.")
-
-# Setup section
-st.header("Setup")
-
-# Input the goal
-st.subheader("Goal")
-goal_input = st.text_area("What is your evaluation goal?", value=st.session_state.goal, height=100)
-if goal_input != st.session_state.goal:
-    st.session_state.goal = goal_input
-
-# Input items to evaluate
-st.subheader("Items to Evaluate")
-
-# Create two columns for the items section
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    item_count = len(st.session_state.items)
-    item_text = "\n\n".join(st.session_state.items)
-    
-    items_input = st.text_area(
-        "Enter the items to evaluate (one per line or separated by blank lines):",
-        value=item_text,
-        height=300
+    # Get pairwise comparison matrix and variance matrix
+    pcm, variance_matrix = query_llm_for_item_comparisons(
+        items, attribute_prompt, num_samples=num_samples
     )
     
-    # Parse and update items when input changes
-    if items_input != item_text:
-        # Split by double newlines or single newlines
-        new_items = re.split(r'\n\n|\n', items_input)
-        # Filter out empty items
-        new_items = [item.strip() for item in new_items if item.strip()]
-        st.session_state.items = new_items
+    # Calculate consistency
+    consistency_score, perfect_matrix = calculate_consistency(pcm)
+    
+    # Update session state
+    st.session_state["matrix"] = pcm
+    st.session_state["perfect_matrix"] = perfect_matrix
+    st.session_state["consistency_score"] = consistency_score
+    st.session_state["variance_matrix"] = variance_matrix
+    
+    st.success(f"Analysis completed with {num_samples} samples per pair!")
+
+# Main app UI with improved styling
+st.title("🧠 Consistency Checker")
+st.markdown("""
+<div style="background-color: #f0f7ff; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
+This tool tests how <b>logically consistent</b> LLMs are when making pairwise comparisons between different entities.
+</div>
+""", unsafe_allow_html=True)
+
+# Create a cleaner layout with columns
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    # Input the attribute prompt
+    st.subheader("Comparison Prompt")
+    attribute_prompt = st.text_area("", 
+                                  value=st.session_state["attribute_prompt"],
+                                  help="This prompt will be sent to the LLM for each pairwise comparison",
+                                  height=70)
+    if attribute_prompt != st.session_state["attribute_prompt"]:
+        st.session_state["attribute_prompt"] = attribute_prompt
 
 with col2:
-    st.write("**Add Individual Items**")
+    # Model settings
+    st.subheader("Model Settings")
     
-    new_item = st.text_area("New item:", height=100, key="new_item_input")
-    
-    if st.button("Add Item", use_container_width=True):
-        if new_item.strip():
-            st.session_state.items.append(new_item.strip())
-            # Clear the input
-            st.session_state.new_item_input = ""
-            st.rerun()
-    
-    if st.button("Clear All Items", use_container_width=True):
-        st.session_state.items = []
-        st.rerun()
-    
-    st.write(f"Total items: **{len(st.session_state.items)}**")
+    # Number of samples per pair
+    num_samples = st.number_input(
+        "Samples per pair:",
+        min_value=1,
+        max_value=10,
+        value=st.session_state["num_samples"],
+        help="Number of times to query the LLM for each pair to measure variance"
+    )
+    if num_samples != st.session_state["num_samples"]:
+        st.session_state["num_samples"] = num_samples
 
-# Run analysis button
-if st.button("Run AHP Analysis", type="primary", use_container_width=True):
-    run_ahp_analysis()
-
+# Add a divider
 st.markdown("---")
 
-# Main area for results
-if st.session_state.attributes:
-    # Display the attributes
-    st.header("Attributes for Evaluation")
+# Input entities to evaluate
+st.subheader("Entities to Compare")
+
+# Create form for items
+with st.form(key="items_form"):
+    # Get default items if needed
+    default_items = load_default_data()
     
-    attributes_df = pd.DataFrame([
-        {
-            "Name": attr["name"], 
-            "Description": attr.get("description", ""), 
-            "Comparison Prompt": attr["prompt"]
-        } 
-        for attr in st.session_state.attributes
-    ])
+    # Access items safely
+    if "items" not in st.session_state or not isinstance(st.session_state["items"], list):
+        st.session_state["items"] = default_items
     
-    st.dataframe(attributes_df, hide_index=True)
+    items = st.session_state["items"]
+        
+    # Create a grid layout for entities
+    num_items = len(items)
+    rows = (num_items + 1) // 2  # Calculate number of rows, with 2 entities per row
     
-    # Display attribute weights
-    if st.session_state.attribute_weights:
-        st.header("Attribute Importance Weights")
-        
-        # Calculate attribute weights
-        attr_weights = solve_pcm_geometric_mean(np.array(st.session_state.attribute_weights))
-        
-        # Create a DataFrame for attribute weights
-        attr_weight_df = pd.DataFrame({
-            "Attribute": [attr["name"] for attr in st.session_state.attributes],
-            "Weight": attr_weights
-        })
-        
-        # Sort by weight descending
-        attr_weight_df = attr_weight_df.sort_values("Weight", ascending=False)
-        
-        # Display as a bar chart
-        st.bar_chart(attr_weight_df.set_index("Attribute"))
-        
-        # Display the pairwise comparison matrix
-        with st.expander("View Attribute Pairwise Comparison Matrix"):
-            attr_names = [attr["name"] for attr in st.session_state.attributes]
-            attr_pcm_df = pd.DataFrame(st.session_state.attribute_weights, index=attr_names, columns=attr_names)
-            st.dataframe(attr_pcm_df.style.format("{:.2f}"))
+    # Create text inputs for each item in a grid
+    item_inputs = []
+    for row in range(rows):
+        cols = st.columns(2)  # 2 columns per row
+        for col in range(2):
+            i = row * 2 + col
+            if i < num_items:
+                # Use A, B, C... as labels
+                label = chr(65 + i)  # ASCII: A=65, B=66, etc.
+                with cols[col]:
+                    item_inputs.append(
+                        st.text_area(f"Entity {label}", value=items[i], height=70, key=f"item_{i}")
+                    )
     
-    # Display item comparison matrices for each attribute
-    if st.session_state.attribute_matrices:
-        st.header("Item Comparisons by Attribute")
-        
-        # Create tabs for each attribute
-        tabs = st.tabs([attr["name"] for attr in st.session_state.attributes])
-        
-        for i, attr in enumerate(st.session_state.attributes):
-            with tabs[i]:
-                # Get the matrix for this attribute
-                matrix = st.session_state.attribute_matrices[attr["name"]]
-                
-                # Calculate weights for this attribute
-                weights = solve_pcm_geometric_mean(np.array(matrix))
-                
-                # Display the weights as a bar chart
-                item_weights_df = pd.DataFrame({
-                    "Item": [f"Item {j+1}" for j in range(len(st.session_state.items))],
-                    "Weight": weights
-                })
-                
-                st.subheader(f"Weights for {attr['name']}")
-                st.bar_chart(item_weights_df.set_index("Item"))
-                
-                # Display the pairwise comparison matrix
-                with st.expander(f"View Pairwise Comparison Matrix for {attr['name']}"):
-                    item_labels = [f"Item {j+1}" for j in range(len(st.session_state.items))]
-                    pcm_df = pd.DataFrame(matrix, index=item_labels, columns=item_labels)
-                    st.dataframe(pcm_df.style.format("{:.2f}"))
+    # Add/remove entity buttons with better styling
+    st.markdown("#### Actions")
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        add_item = st.form_submit_button("➕ Add Entity", use_container_width=True)
+    with col2:
+        remove_item = st.form_submit_button("➖ Remove Last", use_container_width=True)
+    with col3:
+        # Form submission button with prominent styling
+        analyze_button = st.form_submit_button("▶️ Run Consistency Analysis", 
+                                            use_container_width=True,
+                                            type="primary")
+
+# Handle form actions
+if add_item:
+    st.session_state["items"].append("New Entity")
+    st.rerun()
     
-    # Display final AHP scores
-    if st.session_state.ahp_scores:
-        st.header("AHP Results")
-        
-        # Format scores for display
-        items = st.session_state.items
-        scores = st.session_state.ahp_scores
-        
-        # Create a DataFrame with items and scores
-        results_df = pd.DataFrame({
-            "Item #": [f"Item {i+1}" for i in range(len(items))],
-            "Item Text": [item[:100] + "..." if len(item) > 100 else item for item in items],
-            "AHP Score": [scores[i] for i in range(len(items))]
-        })
-        
-        # Sort by score descending
-        results_df = results_df.sort_values("AHP Score", ascending=False)
-        
-        # Display as a table
-        st.dataframe(results_df.style.format({"AHP Score": "{:.4f}"}), hide_index=True)
-        
-        # Display as a bar chart
-        chart_df = pd.DataFrame({
-            "Item": [f"Item {i+1}" for i in range(len(items))],
-            "Score": [scores[i] for i in range(len(items))]
-        })
-        chart_df = chart_df.sort_values("Score", ascending=False)
-        
-        st.bar_chart(chart_df.set_index("Item"))
-        
-        # Display the top ranked items with full text
-        st.subheader("Top Ranked Items")
-        
-        # Get the indices of the top 3 items (or fewer if there aren't 3)
-        top_count = min(3, len(items))
-        
-        # Get the indices sorted by score
-        sorted_indices = sorted(range(len(items)), key=lambda i: scores[i], reverse=True)
-        
-        # Display the top items
-        for rank, idx in enumerate(sorted_indices[:top_count]):
-            with st.container(border=True):
-                st.markdown(f"#### {rank+1}. Item {idx+1} (Score: {scores[idx]:.4f})")
-                st.markdown(f"_{items[idx]}_")
-        
-        # Show all items in an expander
-        with st.expander("View All Items Ranked"):
-            for rank, idx in enumerate(sorted_indices):
-                st.markdown(f"**{rank+1}. Item {idx+1} (Score: {scores[idx]:.4f})**")
-                st.markdown(f"{items[idx]}")
-                st.markdown("---")
+if remove_item and len(st.session_state["items"]) > 1:
+    st.session_state["items"].pop()
+    st.rerun()
+
+# Update items from input fields
+for i, key in enumerate([f"item_{j}" for j in range(len(st.session_state["items"]))]):
+    if key in st.session_state:
+        st.session_state["items"][i] = st.session_state[key]
+
+# Run analysis if button was clicked
+if analyze_button:
+    run_analysis()
+
+# Show results if analysis has been run
+if "matrix" in st.session_state and st.session_state["matrix"] is not None:
+    st.header("Analysis Results")
     
-    # Compare AHP with direct ranking
-    if st.session_state.ahp_scores and st.session_state.direct_scores:
-        st.header("AHP vs Direct Ranking Comparison")
+    # Get the data
+    matrix = st.session_state["matrix"]
+    perfect_matrix = st.session_state["perfect_matrix"]
+    consistency_score = st.session_state["consistency_score"]
+    items = st.session_state["items"]
+    
+    # Create nice labels using letters (A, B, C...)
+    labels = [chr(65 + i) for i in range(len(items))]
+    
+    # Show consistency score with explanation
+    score_color = "green" if consistency_score < 0.1 else "orange" if consistency_score < 0.2 else "red"
+    st.markdown(f"### Consistency Score: <span style='color:{score_color}'>{consistency_score:.3f}</span>", unsafe_allow_html=True)
+    
+    # Interpret the score
+    if consistency_score < 0.1:
+        st.success("The LLM's judgments are highly consistent!")
+    elif consistency_score < 0.2:
+        st.warning("The LLM's judgments have some inconsistencies.")
+    else:
+        st.error("The LLM's judgments are significantly inconsistent.")
         
-        items = st.session_state.items
-        ahp_scores = st.session_state.ahp_scores
-        direct_scores = st.session_state.direct_scores
-        
-        # Create comparison DataFrame
-        comparison_df = pd.DataFrame({
-            "Item #": [f"Item {i+1}" for i in range(len(items))],
-            "Item Text": [item[:100] + "..." if len(item) > 100 else item for item in items],
-            "AHP Score": [ahp_scores.get(i, 0) for i in range(len(items))],
-            "Direct Score": [direct_scores.get(i, 0) for i in range(len(items))]
-        })
-        
-        # Calculate difference and rank difference
-        comparison_df["Difference"] = comparison_df["AHP Score"] - comparison_df["Direct Score"]
-        
-        # Sort by AHP score
-        comparison_df = comparison_df.sort_values("AHP Score", ascending=False)
-        
-        # Display as a table
-        st.dataframe(comparison_df.style.format({
-            "AHP Score": "{:.4f}",
-            "Direct Score": "{:.4f}",
-            "Difference": "{:.4f}"
-        }), hide_index=True)
-        
-        # Display side-by-side top items
-        st.subheader("Top Items Comparison")
-        
-        # Create two columns
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### Top 3 by AHP")
-            # Get indices sorted by AHP score
-            ahp_sorted = sorted(range(len(items)), key=lambda i: ahp_scores.get(i, 0), reverse=True)
+    # Explain the consistency score calculation
+    st.info("""
+    **What this score means:**
+    
+    The consistency score measures how well the LLM's pairwise comparisons align with perfect mathematical consistency.
+    
+    - **0.0** would be perfect consistency (impossible in practice)
+    - **< 0.1** indicates excellent consistency
+    - **0.1 - 0.2** indicates acceptable consistency
+    - **> 0.2** indicates concerning inconsistency
+    
+    *Technical explanation:* This score is calculated as the average logarithmic difference between the actual pairwise ratios and what they would be in a perfectly consistent matrix derived from the calculated weights. Smaller values indicate better consistency.
+    """)
+    
+    # Calculate weights using geometric mean method
+    weights = solve_pcm_geometric_mean(matrix)
+    
+    # Create unified results display
+    st.subheader("Comparison Matrix with Consistency Analysis")
+    
+    # Display settings used for this analysis
+    st.markdown(f"**Analysis Settings:** Samples per pair = {num_samples}")
+    
+    # If we have variance information, display it
+    if "variance_matrix" in st.session_state and st.session_state["variance_matrix"] is not None:
+        with st.expander("View Variance Analysis"):
+            # Calculate average variance
+            variance_matrix = st.session_state["variance_matrix"]
+            avg_variance = np.mean(variance_matrix[np.triu_indices_from(variance_matrix, k=1)])
             
-            # Display top 3 AHP items
-            for rank, idx in enumerate(ahp_sorted[:3]):
-                with st.container(border=True):
-                    st.markdown(f"**{rank+1}. Item {idx+1} (Score: {ahp_scores.get(idx, 0):.4f})**")
-                    st.markdown(f"{items[idx]}")
-        
-        with col2:
-            st.markdown("### Top 3 by Direct Ranking")
-            # Get indices sorted by direct score
-            direct_sorted = sorted(range(len(items)), key=lambda i: direct_scores.get(i, 0), reverse=True)
+            st.markdown(f"**Average Variance:** {avg_variance:.4f}")
+            st.info("This represents how much the LLM's judgments varied across multiple samples for each pair. Lower values indicate more consistent responses.")
             
-            # Display top 3 direct items
-            for rank, idx in enumerate(direct_sorted[:3]):
-                with st.container(border=True):
-                    st.markdown(f"**{rank+1}. Item {idx+1} (Score: {direct_scores.get(idx, 0):.4f})**")
-                    st.markdown(f"{items[idx]}")
+            # Create a visualization of the variance matrix
+            variance_df = pd.DataFrame(variance_matrix, index=labels, columns=labels)
+            
+            # Define a function to highlight high variance
+            def highlight_variance(val):
+                if i == j:  # Skip diagonal
+                    return 'background-color: #f0f0f0'
+                    
+                if val > 0.5:
+                    return 'background-color: #ff9999'  # Red for high variance
+                elif val > 0.2:
+                    return 'background-color: #ffcc99'  # Orange for medium variance
+                elif val > 0.05:
+                    return 'background-color: #ffffcc'  # Yellow for low variance
+                elif val > 0:
+                    return 'background-color: #ccffcc'  # Green for very low variance
+                else:
+                    return 'background-color: #f0f0f0'  # Gray for zero variance
+            
+            # Display the variance matrix
+            st.subheader("Variance Matrix")
+            st.dataframe(
+                variance_df.style.format("{:.4f}").applymap(lambda x: f"background-color: {'#ff9999' if x > 0.5 else '#ffcc99' if x > 0.2 else '#ffffcc' if x > 0.05 else '#ccffcc' if x > 0 else '#f0f0f0'}"),
+                use_container_width=True
+            )
+            
+            # Add variance legend
+            st.markdown("""
+            **Variance Legend:**
+            - <span style='background-color: #ccffcc; padding: 2px 5px;'>Green</span>: Very low variance (< 0.05)
+            - <span style='background-color: #ffffcc; padding: 2px 5px;'>Yellow</span>: Low variance (0.05 - 0.2)
+            - <span style='background-color: #ffcc99; padding: 2px 5px;'>Orange</span>: Medium variance (0.2 - 0.5)
+            - <span style='background-color: #ff9999; padding: 2px 5px;'>Red</span>: High variance (> 0.5)
+            """, unsafe_allow_html=True)
+    
+    # Calculate log differences for color coding
+    diff_matrix = np.zeros_like(matrix)
+    for i in range(len(matrix)):
+        for j in range(len(matrix)):
+            if perfect_matrix[i, j] > 0 and matrix[i, j] > 0:
+                diff_matrix[i, j] = abs(np.log10(matrix[i, j]) - np.log10(perfect_matrix[i, j]))
+            else:
+                diff_matrix[i, j] = 0
+    
+    # Create a DataFrame with matrix values
+    df_combined = pd.DataFrame(matrix, index=labels, columns=labels)
+    
+    # Create a DataFrame for weights
+    weight_df = pd.DataFrame({
+        "Entity": labels,
+        "Weight": weights
+    }).set_index("Entity")
+    
+    # Join the matrix with weights column
+    df_combined = pd.concat([df_combined, weight_df], axis=1)
+    
+    # Define the styling function for the combined table
+    def color_consistency(df):
+        # Make a copy to avoid modifying the original DataFrame
+        styled = pd.DataFrame('', index=df.index, columns=df.columns)
         
-        # Display reasoning for direct ranking
-        if hasattr(st.session_state, 'direct_reasoning') and st.session_state.direct_reasoning:
-            with st.expander("Direct Ranking Reasoning"):
-                st.write(st.session_state.direct_reasoning)
+        # Format and color background based on consistency
+        for i in range(len(labels)):
+            for j in range(len(labels)):
+                val = matrix[i, j]
+                diff = diff_matrix[i, j]
+                
+                # Format the number with 3 decimal places
+                cell_value = f"{val:.3f}"
+                
+                # Choose background color based on deviation from ideal
+                if i != j:  # Skip diagonal
+                    if diff > 0.5:
+                        bg_color = '#ff9999'  # Red for large inconsistency
+                    elif diff > 0.2:
+                        bg_color = '#ffcc99'  # Orange for medium inconsistency
+                    elif diff > 0.1:
+                        bg_color = '#ffffcc'  # Yellow for small inconsistency
+                    else:
+                        bg_color = '#ccffcc'  # Green for consistent
+                else:
+                    bg_color = '#f0f0f0'  # Gray for diagonal
+                
+                styled.iloc[i, j] = f'background-color: {bg_color}'
+                
+        # Format the weights column
+        for i in range(len(labels)):
+            styled.iloc[i, -1] = 'background-color: #e6f3ff; font-weight: bold'
+            
+        return styled
+    
+    # Apply styling and display
+    st.dataframe(
+        df_combined.style
+        .format({col: "{:.3f}" for col in labels})
+        .format({"Weight": "{:.3f}"})
+        .apply(color_consistency, axis=None),
+        use_container_width=True
+    )
+    
+    # Add legend for color coding
+    st.markdown("""
+    **Color Legend:**
+    - <span style='background-color: #ccffcc; padding: 2px 5px;'>Green</span>: Highly consistent (< 0.1 difference)
+    - <span style='background-color: #ffffcc; padding: 2px 5px;'>Yellow</span>: Slightly inconsistent (0.1 - 0.2 difference)
+    - <span style='background-color: #ffcc99; padding: 2px 5px;'>Orange</span>: Moderately inconsistent (0.2 - 0.5 difference)
+    - <span style='background-color: #ff9999; padding: 2px 5px;'>Red</span>: Highly inconsistent (> 0.5 difference)
+    """, unsafe_allow_html=True)
+    
+    # Display the weights as a bar chart
+    st.subheader("Entity Weights Visualization")
+    st.bar_chart(weight_df)
+    
+    # Optional: Show the tabs for detailed view
+    with st.expander("Show Detailed Matrices"):
+        tab1, tab2 = st.tabs(["Ideal Consistent Matrix", "Difference Matrix"])
         
-        # Display as a comparison chart
-        st.subheader("Score Comparison Chart")
-        chart_data = pd.DataFrame({
-            "Item": [f"Item {i+1}" for i in range(len(items))],
-            "AHP": [ahp_scores.get(i, 0) for i in range(len(items))],
-            "Direct": [direct_scores.get(i, 0) for i in range(len(items))]
-        })
+        with tab1:
+            # Convert to pandas DataFrame for better display
+            df_perfect = pd.DataFrame(perfect_matrix, index=labels, columns=labels)
+            st.dataframe(df_perfect.style.format("{:.3f}"), use_container_width=True)
+            st.info("This matrix shows what a perfectly consistent matrix would look like based on the calculated weights.")
+            
+        with tab2:
+            # Calculate difference matrix
+            diff_matrix_display = matrix - perfect_matrix
+            
+            # Convert to pandas DataFrame for better display
+            df_diff = pd.DataFrame(diff_matrix_display, index=labels, columns=labels)
+            
+            # Custom formatting for differences
+            def highlight_diff(val):
+                color = 'white'
+                if abs(val) > 1.0:
+                    color = '#ff9999'  # red
+                elif abs(val) > 0.5:
+                    color = '#ffcc99'  # orange
+                elif abs(val) > 0.1:
+                    color = '#ffffcc'  # yellow
+                return f'background-color: {color}'
+            
+            st.dataframe(df_diff.style.format("{:.3f}").applymap(highlight_diff), use_container_width=True)
+            st.info("This shows the difference between the LLM's judgments and what would be perfectly consistent judgments.")
+    
+    # Removed Inconsistency Details section
+    
+    # Explain inconsistency
+    with st.expander("Understanding Consistency in Pairwise Comparisons"):
+        st.markdown("""
+        ### What is Consistency?
         
-        # Sort by AHP score
-        chart_data = chart_data.sort_values("AHP", ascending=False)
+        In pairwise comparisons, consistency means that your judgments follow logical transitivity. For example:
         
-        # Reshape for charting
-        chart_data_melted = pd.melt(
-            chart_data, 
-            id_vars=["Item"], 
-            value_vars=["AHP", "Direct"],
-            var_name="Method", 
-            value_name="Score"
-        )
+        - If A is 2 times better than B, and
+        - B is 3 times better than C, then
+        - A should be 6 times better than C (2 × 3)
         
-        # Create a grouped bar chart
-        st.bar_chart(chart_data_melted.pivot(index="Item", columns="Method", values="Score"))
+        ### How to Read the Consistency Score
         
-        # Calculate correlation and agreement metrics
-        correlation = np.corrcoef(
-            [ahp_scores.get(i, 0) for i in range(len(items))],
-            [direct_scores.get(i, 0) for i in range(len(items))]
-        )[0, 1]
+        The consistency score measures how much the LLM's judgments deviate from perfect logical consistency:
         
-        # Calculate rank correlation (Spearman)
-        # First get the rankings (not the scores)
-        ahp_ranks = {idx: rank for rank, idx in enumerate(ahp_sorted)}
-        direct_ranks = {idx: rank for rank, idx in enumerate(direct_sorted)}
+        - **< 0.1:** Highly consistent judgments
+        - **0.1 - 0.2:** Moderately consistent with some inconsistencies
+        - **> 0.2:** Significantly inconsistent judgments
         
-        # Calculate the sum of squared differences in ranks
-        d_squared_sum = sum((ahp_ranks.get(i, 0) - direct_ranks.get(i, 0))**2 for i in range(len(items)))
+        ### Why Inconsistency Happens
         
-        # Calculate Spearman's rank correlation coefficient
-        n = len(items)
-        if n > 1:
-            spearman = 1 - (6 * d_squared_sum) / (n * (n**2 - 1))
-        else:
-            spearman = 1.0
+        Inconsistency in LLM judgments can occur because:
         
-        # Calculate agreement on top items
-        top_k = min(3, len(items))
-        top_ahp = set(ahp_sorted[:top_k])
-        top_direct = set(direct_sorted[:top_k])
-        agreement = len(top_ahp.intersection(top_direct)) / top_k
-        
-        # Display correlation metrics
-        st.subheader("Agreement Metrics")
-        metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
-        
-        with metrics_col1:
-            st.metric("Pearson Correlation", f"{correlation:.3f}", 
-                     help="Pearson correlation between AHP and Direct scores (1.0 = perfect correlation)")
-        
-        with metrics_col2:
-            st.metric("Rank Correlation", f"{spearman:.3f}", 
-                     help="Spearman's rank correlation between AHP and Direct rankings (1.0 = identical ranking order)")
-        
-        with metrics_col3:
-            st.metric(f"Top {top_k} Agreement", f"{agreement:.0%}", 
-                     help=f"Percentage of items that appear in both top {top_k} lists")
-else:
-    st.info("Click 'Run AHP Analysis' to start the process.")
+        1. The LLM may focus on different aspects when making different comparisons
+        2. The LLM lacks a global view of all its judgments
+        3. Even humans make inconsistent judgments for complex comparisons
+        """)
 
 # Footer
 st.markdown("---")
-st.caption("Analytic Hierarchy Process (AHP) Agent - Uses LLM to decompose complex evaluation into manageable pairwise comparisons")
+st.caption("Consistency Checker - Tests if LLMs make logically consistent pairwise comparison judgments")
